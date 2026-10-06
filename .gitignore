@@ -1,0 +1,23 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Node
+node_modules/
+package-lock.json
+
+# npm pack output
+*.tgz
+
+# Local backups / editor
+*.bak
+*.swp
+*.swo
+.DS_Store
+
+# Secrets
+.env
+.env.*
