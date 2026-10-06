@@ -165,6 +165,9 @@ asyncio.run(main())
   check("harness.ts plugin",
     fs.existsSync(path.join(PLUGINS_DIR, "harness.ts")));
 
+  check("config UI present",
+    fs.existsSync(path.join(TOOLS_DIR, "harness-config-ui.py")));
+
   console.log("");
   if (issues === 0) info("All checks passed.");
   else {
@@ -204,6 +207,13 @@ const serverTemplate = path.join(__dirname, "..", "templates", "server.py");
 if (!fs.existsSync(serverTemplate)) fail("templates/server.py missing from package");
 fs.copyFileSync(serverTemplate, path.join(TOOLS_DIR, "server.py"));
 info("Installed server.py");
+
+const uiTemplate = path.join(__dirname, "..", "bin", "harness-config-ui.py");
+if (fs.existsSync(uiTemplate)) {
+  fs.copyFileSync(uiTemplate, path.join(TOOLS_DIR, "harness-config-ui.py"));
+  fs.chmodSync(path.join(TOOLS_DIR, "harness-config-ui.py"), 0o755);
+  info("Installed harness-config-ui.py");
+}
 
 info("Testing server...");
 const test = spawnSync(venvPy, ["-c", `

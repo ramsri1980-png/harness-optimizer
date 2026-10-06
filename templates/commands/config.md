@@ -2,14 +2,22 @@
 description: Open the Harness-Optimizer configuration web UI.
 ---
 
-Open the Harness-Optimizer configuration web UI.
+Open the Harness-Optimizer config UI.
 
 Steps:
-1. Check if `opencode-studio-server` is running: `pgrep -f opencode-studio-server`
-2. If not running, start it: `nohup opencode-studio-server > /tmp/opencode-studio.log 2>&1 &`
-3. Open the browser: `xdg-open http://localhost:1080 || open http://localhost:1080`
-4. Confirm to the user that the browser is opening.
+1. Check if it's already running:
+   `pgrep -f harness-config-ui.py`
+2. If not running, start it in the background:
+   `nohup python3 ~/developer/harness-optimizer/bin/harness-config-ui.py > /tmp/harness-config-ui.log 2>&1 &`
+3. Open the browser:
+   `xdg-open http://localhost:8765 || open http://localhost:8765`
+4. Confirm to the user that the UI is opening at http://localhost:8765
 
-The web UI at localhost:1080 manages ONLY the Harness-Optimizer MCP server,
-its model assignments, fallback chains, and the token-metrics plugin.
-For all other OpenCode settings, use the built-in `/config` TUI command.
+The UI at localhost:8765 manages:
+- Model priority and fallback chains per agent
+- MCP tool toggles (HARNESS_TOOLS)
+- Config backups and restore
+- Token savings totals
+
+Changes save directly to ~/.config/opencode/opencode.json.
+Restart OpenCode after saving to apply.
