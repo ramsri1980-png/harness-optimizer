@@ -60,6 +60,31 @@ After install, see ~/developer/harness-optimizer/docs/:
 - CONFIGURATION.md
 - TROUBLESHOOTING.md
 
+## Security Model
+
+`execute_and_capture` uses an **executable-name whitelist** (pytest, python3,
+git, ls, cat, grep, rg, find) for convenience — **not for security**.
+Whitelisted interpreters like `python3` and `find` are Turing-complete: they
+can write files, spawn subprocesses, and access the network.
+
+The tool applies a **best-effort pattern guard** that refuses the most obvious
+bypasses (e.g., `python3 -c "open('x','w')..."`, `find -exec rm`, `git config
+--global`). This guard is deliberately shallow. It stops accidental misuse and
+signals intent — it is **not a sandbox**.
+
+For real isolation when running autonomous agents:
+- Run OpenCode inside a container or VM
+- Use OpenCode's native per-command permission prompts
+- Review every mutation before accepting it
+
+## Model Compatibility
+
+The harness tools are exposed over MCP with strict schemas. Some free-tier
+routers and small models hallucinate parameter names (e.g., `path` instead of
+`file_path`) and drop the `[TOKEN METRIC]` line from tool output. When this
+happens, tool calls fail silently or the metric doesn't display.
+
+**Recommended models:** DeepSeek V3/V4, Claude Sonnet/Opus, GPT-4/4o, or any
 ## License
 
 MIT
