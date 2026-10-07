@@ -42,7 +42,8 @@ def register(name: str):
 ALLOWED_COMMANDS = {
     "pytest", "python3", "python", "git", "ls", "cat", "grep", "rg", "find",
 }
-
+MAX_OUTPUT_LINES = 60
+MAX_OUTPUT_CHARS = 200_000
 
 def estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
@@ -51,7 +52,7 @@ def estimate_tokens(text: str) -> int:
 async def emit_metric(ctx: Context, tool: str, saved: int, baseline: int, actual: int) -> str:
     line = (
         f"[TOKEN METRIC] tool={tool} saved={saved:,} "
-        f"baseline={baseline:,} actual={actual:,}"
+        f"baseline={baseline:,} actual={actual:,} type=payload_reduction"
     )
     await ctx.info(line)
     return line
@@ -121,7 +122,7 @@ async def get_repo_skeleton(repo_path: str = ".", max_files: int = 500):
     saved = max(0, baseline - actual)
     metric = (
         f"[TOKEN METRIC] tool=get_repo_skeleton "
-        f"saved={saved} baseline={baseline} actual={actual}"
+        f"saved={saved} baseline={baseline} actual={actual} type=payload_reduction"
     )
 
     return skeleton_text + "\n\n" + metric
@@ -210,7 +211,7 @@ async def apply_search_replace(file_path: str, search_block: str, replace_block:
     full_rewrite = estimate_tokens(new_content)
     patch = estimate_tokens(search_block + replace_block)
     saved = max(0, full_rewrite - patch)
-    metric = f"[TOKEN METRIC] tool=apply_search_replace saved={saved} baseline={full_rewrite} actual={patch}"
+    metric = f"[TOKEN METRIC] tool=apply_search_replace saved={saved} baseline={full_rewrite} actual={patch} type=payload_reduction"
     return "Surgical replacement applied successfully.\n\n" + metric
 
 # ═══════════════════════════════════════════════════════════
@@ -280,7 +281,11 @@ async def rollback_show(repo_path: str) -> str:
     """READ-ONLY. Shows what would be lost if the user resets the repo.
     Does NOT execute any rollback. Presents copyable commands."""
     try:
-        diff_stat = subprocess.run(
+        diff_staged = subprocess.run(
+            ["git", "diff", "--cached", "--stat"], cwd=repo_path,
+            capture_output=True, text=True, shell=False,
+        )
+        diff_unstaged = subprocess.run(
             ["git", "diff", "--stat"], cwd=repo_path,
             capture_output=True, text=True, shell=False,
         )
@@ -294,9 +299,13 @@ async def rollback_show(repo_path: str) -> str:
         )
 
         r = ["═══ ROLLBACK IMPACT REPORT ═══", ""]
-        r.append("Modified tracked files:")
-        r.append(diff_stat.stdout.strip() or "  (none)")
-
+        staged_text = diff_staged.stdout.strip()
+        unstaged_text = diff_unstaged.stdout.strip()
+        r.append("Staged changes (in index, would be lost by reset):")
+        r.append(staged_text or "  (none)")
+        r.append("")
+        r.append("Unstaged changes (working tree, would be lost by checkout/reset):")
+        r.append(unstaged_text or "  (none)")
         untracked = [l for l in status.stdout.splitlines() if l.startswith("??")]
         if untracked:
             r.append("")
@@ -389,27 +398,41 @@ async def execute_and_capture(command: str, timeout_seconds: int = 15):
             timeout=timeout_seconds,
             shell=False
         )
+
         output = result.stdout + "\n" + result.stderr
         lines = output.splitlines()
-        
+        over_lines = len(lines) > MAX_OUTPUT_LINES
+        over_chars = len(output) > MAX_OUTPUT_CHARS
+
         response = [
             f"Exit code: {result.returncode}",
             f"Timed out: no",
-            f"Output truncated: {'yes' if len(lines) > 60 else 'no'}"
+            f"Output truncated: {'yes' if (over_lines or over_chars) else 'no'}",
         ]
-        
-        if len(lines) > 60:
+
+        if over_lines:
             truncated = "\n".join(
-                lines[:30]
-                + ["\n... [ LOGS CLIPPED TO PREVENT TOKEN BURN ] ...\n"]
-                + lines[-30:]
+                lines[: MAX_OUTPUT_LINES // 2]
+                + ["\n... [ LOGS CLIPPED: line limit reached ] ...\n"]
+                + lines[-(MAX_OUTPUT_LINES // 2):]
             )
             response.append("Relevant output:\n" + truncated)
+        elif over_chars:
+            half = MAX_OUTPUT_CHARS // 2
+            head = output[:half]
+            tail = output[-half:]
+            dropped = len(output) - MAX_OUTPUT_CHARS
+            response.append(
+                "Relevant output:\n"
+                + head
+                + f"\n... [ CLIPPED: {dropped} chars dropped to stay under {MAX_OUTPUT_CHARS} ] ...\n"
+                + tail
+            )
         else:
             response.append("Relevant output:\n" + output)
-            
+
         return "\n".join(response)
-        
+
     except subprocess.TimeoutExpired:
         return (
             "Exit code: -1\n"

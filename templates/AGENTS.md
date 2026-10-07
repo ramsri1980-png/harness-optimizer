@@ -13,9 +13,13 @@ include that line verbatim in your reply when it is easy to do so:
 
     💰 <tool_name>: saved <N> tokens (<baseline> baseline → <actual> actual)
 
-Do not summarize or fabricate the numbers. The token-metrics plugin also
-records every metric to `~/.config/opencode/.harness-token-metrics.log`, so
-skipping the line in chat is acceptable — never invent a replacement.
+The `<N>` value is an **estimated payload reduction** — the difference between
+the full-file representation and the returned excerpt, computed as
+`len(text)//4`. It is **not** a measured end-to-end token saving.
+
+Do not summarize, inflate, or fabricate the numbers. The token-metrics plugin
+also records every metric to `~/.config/opencode/.harness-token-metrics.log`,
+so skipping the line in chat is acceptable — never invent a replacement.
 
 ## Context Pressure Protocol
 When context-watch warns you, STOP and produce a Context Checkpoint Report:

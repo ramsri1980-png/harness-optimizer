@@ -36,7 +36,9 @@ Then restart OpenCode. Ask: `List your available tools.`
 
 **Plugins and rules:**
 - harness.ts — OpenCode v2 plugin that parses [TOKEN METRIC] lines and
-  accumulates a running total across sessions
+  accumulates a running total across sessions. **Note:** the `saved` value is
+  an *estimated payload reduction* (`len(text)//4` of full-file baseline minus
+  returned excerpt), not a measured end-to-end token saving.
 - Global AGENTS.md — token protocol, context pressure protocol, plan mode,
   rollback protocol, metric echo rule
 - Custom commands: /plan, /config, /rollback-confirm, /help-harness

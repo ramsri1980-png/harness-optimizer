@@ -71,12 +71,12 @@ if (FLAGS.uninstall) {
   }
   if (fs.existsSync(OPENCODE_JSON)) {
     try {
+      const cfg = JSON.parse(fs.readFileSync(OPENCODE_JSON, "utf8"));
       // V2: remove from mcp.servers
       if (cfg.mcp && cfg.mcp.servers && cfg.mcp.servers["harness-tools"]) {
         delete cfg.mcp.servers["harness-tools"];
         info("Removed harness-tools from opencode.json");
       }
-      const cfg = JSON.parse(fs.readFileSync(OPENCODE_JSON, "utf8"));
       // V1 legacy fallback
       if (cfg.mcp && cfg.mcp["harness-tools"]) {
         delete cfg.mcp["harness-tools"];
@@ -112,16 +112,21 @@ if (FLAGS.uninstall) {
   ]) {
     if (fs.existsSync(f)) { fs.rmSync(f); info(`Removed ${f}`); }
   }
-  // AGENTS.md: restore user's backup if we overwrote it; otherwise remove
+  // AGENTS.md: three cases — restore backup, remove harness-owned, or leave user's alone
   const agentsDst = path.join(CONFIG_DIR, "AGENTS.md");
   const agentsBackup = path.join(CONFIG_DIR, "AGENTS.md.harness-backup");
+  const agentsMarker = path.join(CONFIG_DIR, ".harness-owns-agents");
   if (fs.existsSync(agentsBackup)) {
     fs.copyFileSync(agentsBackup, agentsDst);
     fs.rmSync(agentsBackup);
+    if (fs.existsSync(agentsMarker)) fs.rmSync(agentsMarker);
     info("Restored your original AGENTS.md from backup.");
-  } else if (fs.existsSync(agentsDst)) {
-    fs.rmSync(agentsDst);
-    info(`Removed ${agentsDst}`);
+  } else if (fs.existsSync(agentsMarker)) {
+    if (fs.existsSync(agentsDst)) fs.rmSync(agentsDst);
+    fs.rmSync(agentsMarker);
+    info("Removed harness-created AGENTS.md.");
+  } else {
+    info("AGENTS.md not owned by harness — left in place.");
   }
   console.log("");
   info("Uninstall complete.");
@@ -225,11 +230,13 @@ if (!fs.existsSync(serverTemplate)) fail("templates/server.py missing from packa
 fs.copyFileSync(serverTemplate, path.join(TOOLS_DIR, "server.py"));
 info("Installed server.py");
 
-const uiTemplate = path.join(__dirname, "..", "bin", "harness-config-ui.py");
+const uiTemplate = path.join(__dirname, "..", "templates", "harness-config-ui.py");
 if (fs.existsSync(uiTemplate)) {
   fs.copyFileSync(uiTemplate, path.join(TOOLS_DIR, "harness-config-ui.py"));
   fs.chmodSync(path.join(TOOLS_DIR, "harness-config-ui.py"), 0o755);
   info("Installed harness-config-ui.py");
+} else {
+  warn("harness-config-ui.py template missing — config UI will not be installed.");
 }
 
 info("Testing server...");
@@ -419,17 +426,20 @@ head("Phase: Global AGENTS.md");
 const agentsSrc = path.join(__dirname, "..", "templates", "AGENTS.md");
 const agentsDst = path.join(CONFIG_DIR, "AGENTS.md");
 const agentsBackup = path.join(CONFIG_DIR, "AGENTS.md.harness-backup");
+const agentsMarker = path.join(CONFIG_DIR, ".harness-owns-agents");
 
 if (!fs.existsSync(agentsDst)) {
   fs.copyFileSync(agentsSrc, agentsDst);
-  info("Installed global AGENTS.md");
+  fs.writeFileSync(agentsMarker, new Date().toISOString() + "\n");
+  info("Installed global AGENTS.md (harness-owned).");
 } else if (FLAGS.force) {
   if (!fs.existsSync(agentsBackup)) {
     fs.copyFileSync(agentsDst, agentsBackup);
     info("Backed up existing AGENTS.md → AGENTS.md.harness-backup");
   }
   fs.copyFileSync(agentsSrc, agentsDst);
-  info("Overwrote global AGENTS.md (backup saved).");
+  fs.writeFileSync(agentsMarker, new Date().toISOString() + "\n");
+  info("Overwrote global AGENTS.md (backup saved, harness-owned).");
 } else {
   warn("AGENTS.md exists — preserved. Delete it and re-run to replace.");
 }
@@ -452,6 +462,8 @@ if (fs.existsSync(docsSrc)) {
     fs.cpSync(docsSrc, docsDst, { recursive: true });
     info(`Docs installed → ${docsDst}`);
   }
+} else {
+  warn("docs/ source missing — documentation will not be installed.");
 }
 const studioSrc = path.join(__dirname, "..", "studio_extensions");
 const studioDst = path.join(TOOLS_DIR, "studio_extensions");
@@ -465,6 +477,8 @@ if (fs.existsSync(studioSrc)) {
     fs.cpSync(studioSrc, studioDst, { recursive: true });
     info("Studio extension written.");
   }
+} else {
+  warn("studio_extensions/ source missing — studio UI will not be installed.");
 }
 
 console.log("");
