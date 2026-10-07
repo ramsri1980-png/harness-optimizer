@@ -21,6 +21,7 @@ const FLAGS = {
   doctor:    process.argv.includes("--doctor"),
   force:     process.argv.includes("--force"),
   help:      process.argv.includes("--help") || process.argv.includes("-h"),
+  noRuntime: process.argv.includes("--no-runtime"),
 };
 // ── Helpers ──
 function sha256(buf) {
@@ -268,9 +269,10 @@ if (fs.existsSync(CONFIG_DIR)) {
   fs.cpSync(CONFIG_DIR, BACKUP_DIR, { recursive: true });
   info(`Backed up config → ${BACKUP_DIR}`);
 }
-
-head("Phase: MCP Server");
+const serverTemplate = path.join(__dirname, "..", "templates", "server.py");
 fs.mkdirSync(TOOLS_DIR, { recursive: true });
+if (!FLAGS.noRuntime) {
+head("Phase: MCP Server");
 
 const venvPy = path.join(TOOLS_DIR, "venv", "bin", "python");
 const venvPip = path.join(TOOLS_DIR, "venv", "bin", "pip");
@@ -283,7 +285,19 @@ info("Ensuring FastMCP is installed...");
 execSync(`${venvPip} install --quiet --upgrade pip`, { cwd: TOOLS_DIR, stdio: "inherit" });
 execSync(`${venvPip} install --quiet fastmcp`, { cwd: TOOLS_DIR, stdio: "inherit" });
 
-const serverTemplate = path.join(__dirname, "..", "templates", "server.py");
+info("Testing server...");
+const test = spawnSync(venvPy, ["-c", `
+import asyncio
+from fastmcp import Client
+async def main():
+    async with Client('server.py') as c:
+        print(','.join(t.name for t in await c.list_tools()))
+asyncio.run(main())
+`], { cwd: TOOLS_DIR, encoding: "utf8", timeout: 30000 });
+if (test.status !== 0) fail(`Server test failed:\n${test.stderr}`);
+info(`Server OK — tools: ${test.stdout.trim()}`);
+}
+
 if (!fs.existsSync(serverTemplate)) fail("templates/server.py missing from package");
 fs.copyFileSync(serverTemplate, path.join(TOOLS_DIR, "server.py"));
 info("Installed server.py");
@@ -296,19 +310,6 @@ if (fs.existsSync(uiTemplate)) {
 } else {
   warn("harness-config-ui.py template missing — config UI will not be installed.");
 }
-
-info("Testing server...");
-const test = spawnSync(venvPy, ["-c", `
-import asyncio
-from fastmcp import Client
-async def main():
-    async with Client('server.py') as c:
-        print(','.join(t.name for t in await c.list_tools()))
-asyncio.run(main())
-`], { cwd: TOOLS_DIR, encoding: "utf8", timeout: 30000 });
-if (test.status !== 0) fail(`Server test failed:\n${test.stderr}`);
-info(`Server OK — tools: ${test.stdout.trim()}`);
-
 head("Phase: OpenCode Configuration");
 fs.mkdirSync(COMMANDS_DIR, { recursive: true });
 fs.mkdirSync(PLUGINS_DIR, { recursive: true });
@@ -517,11 +518,13 @@ if (!fs.existsSync(agentsDst)) {
 } else {
   warn("AGENTS.md exists — preserved. Delete it and re-run to replace.");
 }
+if (!FLAGS.noRuntime) {
 head("Phase: OpenCode Plugins via npm");
 for (const pkg of ["opencode-runtime-fallback", "opencode-context-watch", "opencode-studio-server"]) {
   info(`Installing ${pkg}...`);
   const r = spawnSync("npm", ["install", "-g", pkg], { stdio: "inherit" });
   if (r.status !== 0) warn(`${pkg} install failed — install manually later.`);
+}
 }
 head("Phase: Documentation");
 const docsSrc = path.join(__dirname, "..", "docs");

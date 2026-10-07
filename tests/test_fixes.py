@@ -140,6 +140,166 @@ async def test_git_checkpoint_unrelated_staged():
         check("user.py still staged", "A  user.py" in status.stdout or "A user.py" in status.stdout, status.stdout)
 
 
+# ═══════════════════════════════════════════════════════════
+# Regression tests for installer / uninstall / 0.2.6 fixes
+# ═══════════════════════════════════════════════════════════
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+INSTALLER = REPO_ROOT / "bin" / "install.js"
+
+
+def run_installer(home_dir, *args):
+    """Run bin/install.js in an isolated HOME. Returns (rc, stdout+stderr)."""
+    import json
+    env = dict(os.environ)
+    env["HOME"] = str(home_dir)
+    r = subprocess.run(
+        ["node", str(INSTALLER), *args],
+        capture_output=True, text=True, env=env, timeout=60,
+    )
+    return r.returncode, (r.stdout + r.stderr)
+
+
+async def test_uninstall_preserves_git_checkout():
+    print("\n[Test 9] uninstall does not delete user's git checkout (0.2.5)")
+    with tempfile.TemporaryDirectory() as fake_home:
+        home = pathlib.Path(fake_home)
+        tools = home / "developer" / "harness-optimizer"
+        tools.mkdir(parents=True)
+        (tools / ".git").mkdir()  # marker of a user checkout
+
+        run_installer(home, "--no-runtime")
+        rc, out = run_installer(home, "--uninstall")
+        check("Repo dir still exists after uninstall", tools.exists(), out[:300])
+        check("Logs preserved git checkout",
+              "git checkout" in out.lower() or "preserved" in out.lower(),
+              out[:400])
+
+
+async def test_uninstall_does_not_crash():
+    print("\n[Test 10] uninstall references cfg after declaration (0.2.2 fix A)")
+    with tempfile.TemporaryDirectory() as fake_home:
+        home = pathlib.Path(fake_home)
+        (home / ".config" / "opencode").mkdir(parents=True)
+        (home / ".config" / "opencode" / "opencode.json").write_text(
+            '{"mcp": {"servers": {"harness-tools": {"type": "local", "command": ["x"]}}}}\n'
+        )
+        rc, out = run_installer(home, "--uninstall")
+        check("Uninstall exits cleanly", rc == 0, out[:300])
+        check("No 'Cannot access' crash", "Cannot access" not in out, out[:300])
+
+
+async def test_agents_md_marker_install_uninstall():
+    print("\n[Test 11] AGENTS.md ownership marker (0.2.6 fix 4)")
+    with tempfile.TemporaryDirectory() as fake_home:
+        home = pathlib.Path(fake_home)
+        run_installer(home, "--no-runtime")
+
+        md = home / ".config" / "opencode" / "AGENTS.md"
+        marker = home / ".config" / "opencode" / ".harness-owns-agents"
+
+        check("AGENTS.md created on fresh install", md.exists())
+        check("Ownership marker written", marker.exists())
+
+        try:
+            import json
+            payload = json.load(open(marker))
+            check("Marker is JSON with content hash",
+                  bool(payload.get("hash")), str(payload)[:200])
+        except Exception as e:
+            check("Marker is JSON with hash", False, str(e))
+
+
+async def test_agents_md_user_edit_preserved():
+    print("\n[Test 12] user-edited AGENTS.md preserved on uninstall (0.2.6 fix 4)")
+    with tempfile.TemporaryDirectory() as fake_home:
+        home = pathlib.Path(fake_home)
+        run_installer(home, "--no-runtime")
+
+        md = home / ".config" / "opencode" / "AGENTS.md"
+        with open(md, "a") as f:
+            f.write("\n# My personal addition\n")
+
+        rc, out = run_installer(home, "--uninstall")
+        check("AGENTS.md still exists", md.exists())
+        check("User edit intact",
+              "My personal addition" in md.read_text(), md.read_text()[:200])
+        check("Logs edited or preserved",
+              "edited" in out.lower() or "preserved" in out.lower(), out[:400])
+
+
+async def test_mcp_entry_preferences_preserved():
+    print("\n[Test 13] MCP entry survives re-install (0.2.6 fix 2)")
+    with tempfile.TemporaryDirectory() as fake_home:
+        import json
+        home = pathlib.Path(fake_home)
+        run_installer(home, "--no-runtime")
+
+        cfg_path = home / ".config" / "opencode" / "opencode.json"
+        cfg = json.load(open(cfg_path))
+        cfg["mcp"]["servers"]["harness-tools"]["environment"] = {"HARNESS_TOOLS": "none"}
+        cfg["mcp"]["servers"]["harness-tools"]["disabled"] = True
+        cfg_path.write_text(json.dumps(cfg, indent=2))
+
+        run_installer(home, "--no-runtime")
+
+        cfg = json.load(open(cfg_path))
+        ht = cfg["mcp"]["servers"]["harness-tools"]
+        check("HARNESS_TOOLS preserved",
+              ht.get("environment", {}).get("HARNESS_TOOLS") == "none",
+              str(ht)[:300])
+        check("disabled flag preserved",
+              ht.get("disabled") is True, str(ht)[:300])
+
+
+async def test_cumulative_limits():
+    print("\n[Test 14] cumulative line+char limits (0.2.6 fix 1)")
+    out = await server.execute_and_capture(
+        'python3 -c "print(chr(10).join(chr(65)*5000 for _ in range(61)))"'
+    )
+    check("Marked truncated", "Output truncated: yes" in out, out[:200])
+    check("Response under 220k chars", len(out) < 220_000, f"got {len(out)} chars")
+    check("Line marker present", "line limit reached" in out)
+    check("Char marker present", "chars dropped" in out)
+
+
+async def test_installed_ui_has_v2_logic():
+    print("\n[Test 15] installed config UI has V2 patterns (0.2.2 fix C)")
+    with tempfile.TemporaryDirectory() as fake_home:
+        home = pathlib.Path(fake_home)
+        run_installer(home, "--no-runtime")
+
+        ui = home / "developer" / "harness-optimizer" / "harness-config-ui.py"
+        check("Installed UI exists", ui.exists())
+        if ui.exists():
+            content = ui.read_text()
+            check("Has V2 agents lookup",
+                  'cfg.get("agents")' in content or 'cfg["agents"]' in content)
+            check("Has V2 mcp.servers reference",
+                  'mcp.servers' in content or '"servers"' in content)
+
+
+async def test_rollback_show_staged():
+    print("\n[Test 16] rollback_show reports staged changes (0.2.2 fix D)")
+    with tempfile.TemporaryDirectory() as d:
+        subprocess.run(["git", "init", "-q"], cwd=d, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=d, check=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=d, check=True)
+
+        with open(os.path.join(d, "a.txt"), "w") as f:
+            f.write("v1\n")
+        subprocess.run(["git", "add", "a.txt"], cwd=d, check=True)
+        subprocess.run(["git", "commit", "-qm", "init"], cwd=d, check=True)
+
+        with open(os.path.join(d, "a.txt"), "w") as f:
+            f.write("v2\n")
+        subprocess.run(["git", "add", "a.txt"], cwd=d, check=True)
+
+        out = await server.rollback_show(d)
+        check("Staged section present", "Staged changes" in out, out[:400])
+        check("a.txt appears in report", "a.txt" in out, out[:400])
+
+
 async def main():
     print("=" * 60)
     print("Harness-Optimizer Fix Verification")
@@ -152,6 +312,14 @@ async def main():
     await test_apply_search_replace_success()
     await test_get_repo_skeleton_async()
     await test_git_checkpoint_unrelated_staged()
+    await test_uninstall_preserves_git_checkout()
+    await test_uninstall_does_not_crash()
+    await test_agents_md_marker_install_uninstall()
+    await test_agents_md_user_edit_preserved()
+    await test_mcp_entry_preferences_preserved()
+    await test_cumulative_limits()
+    await test_installed_ui_has_v2_logic()
+    await test_rollback_show_staged()
 
     print("\n" + "=" * 60)
     passed = sum(1 for _, ok in results if ok)
