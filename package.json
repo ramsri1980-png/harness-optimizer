@@ -1,11 +1,10 @@
 {
   "name": "harness-optimizer",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "description": "One-command installer for the Harness-Optimizer MCP suite for OpenCode",
   "bin": {
     "harness-optimizer": "./bin/install.js"
   },
-
   "files": [
     "bin/",
     "templates/",
@@ -15,7 +14,6 @@
     "studio_extensions/",
     "README.md"
   ],
-
   "engines": {
     "node": ">=18"
   },
