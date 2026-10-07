@@ -1,8 +1,18 @@
-venv/
-node_modules/
+# Python build artifacts
 __pycache__/
 *.pyc
 *.pyo
-.gitignore
+*.pyd
+venv/
+.venv/
+
+# Tests
+tests/
+
+# Scratch files
 *.bak
-*.tgz
+test_file.txt
+
+# Installer copies at repo root
+server.py
+harness-config-ui.py
