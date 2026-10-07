@@ -5,13 +5,17 @@
   "bin": {
     "harness-optimizer": "./bin/install.js"
   },
+
   "files": [
     "bin/",
     "templates/",
+    "!templates/__pycache__",
+    "!templates/**/*.pyc",
     "docs/",
     "studio_extensions/",
     "README.md"
   ],
+
   "engines": {
     "node": ">=18"
   },
