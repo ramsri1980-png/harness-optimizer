@@ -71,10 +71,16 @@ if (FLAGS.uninstall) {
   }
   if (fs.existsSync(OPENCODE_JSON)) {
     try {
+      // V2: remove from mcp.servers
+      if (cfg.mcp && cfg.mcp.servers && cfg.mcp.servers["harness-tools"]) {
+        delete cfg.mcp.servers["harness-tools"];
+        info("Removed harness-tools from opencode.json");
+      }
       const cfg = JSON.parse(fs.readFileSync(OPENCODE_JSON, "utf8"));
+      // V1 legacy fallback
       if (cfg.mcp && cfg.mcp["harness-tools"]) {
         delete cfg.mcp["harness-tools"];
-        info("Removed harness-tools from opencode.json");
+        info("Removed legacy harness-tools from opencode.json");
       }
       if (Array.isArray(cfg.plugins)) {
         cfg.plugins = cfg.plugins.filter(p => p !== "./plugins");
@@ -102,10 +108,20 @@ if (FLAGS.uninstall) {
     path.join(COMMANDS_DIR, "help-harness.md"),
     path.join(CONFIG_DIR, "opencode-fallback.jsonc"),
     path.join(CONFIG_DIR, "opencode-context-watch.json"),
-    path.join(CONFIG_DIR, "AGENTS.md"),
     METRICS_FILE,
   ]) {
     if (fs.existsSync(f)) { fs.rmSync(f); info(`Removed ${f}`); }
+  }
+  // AGENTS.md: restore user's backup if we overwrote it; otherwise remove
+  const agentsDst = path.join(CONFIG_DIR, "AGENTS.md");
+  const agentsBackup = path.join(CONFIG_DIR, "AGENTS.md.harness-backup");
+  if (fs.existsSync(agentsBackup)) {
+    fs.copyFileSync(agentsBackup, agentsDst);
+    fs.rmSync(agentsBackup);
+    info("Restored your original AGENTS.md from backup.");
+  } else if (fs.existsSync(agentsDst)) {
+    fs.rmSync(agentsDst);
+    info(`Removed ${agentsDst}`);
   }
   console.log("");
   info("Uninstall complete.");
@@ -152,6 +168,7 @@ asyncio.run(main())
     try {
       const cfg = JSON.parse(fs.readFileSync(OPENCODE_JSON, "utf8"));
       check("mcp.harness-tools registered",
+        !!(cfg.mcp && cfg.mcp.servers && cfg.mcp.servers["harness-tools"]) ||
         !!(cfg.mcp && cfg.mcp["harness-tools"]));
       check("plugins dir registered in config",
         Array.isArray(cfg.plugins) && cfg.plugins.includes("./plugins"));
@@ -242,33 +259,73 @@ if (fs.existsSync(OPENCODE_JSON) && !FLAGS.force) {
     cfg = {};
   }
 }
-
+// Ensure V2 schema
 cfg.$schema = cfg.$schema || "https://opencode.ai/config.json";
-cfg.plugins = ["./plugins"];
-delete cfg.plugin;
+
+// ── Plugins: merge, don't clobber ──
+// Migrate legacy `plugin` key
+if (Array.isArray(cfg.plugin) && !Array.isArray(cfg.plugins)) {
+  cfg.plugins = cfg.plugin;
+  delete cfg.plugin;
+}
+cfg.plugins = Array.isArray(cfg.plugins) ? cfg.plugins : [];
+if (!cfg.plugins.includes("./plugins")) {
+  cfg.plugins.push("./plugins");
+}
+
+// ── MCP: V2 shape under mcp.servers ──
 cfg.mcp = cfg.mcp || {};
-cfg.mcp["harness-tools"] = {
+cfg.mcp.servers = cfg.mcp.servers || {};
+// Migrate any V1-style entries (mcp["foo"]) into mcp.servers
+for (const key of Object.keys(cfg.mcp)) {
+  if (key === "servers") continue;
+  if (cfg.mcp[key] && typeof cfg.mcp[key] === "object") {
+    if (!cfg.mcp.servers[key]) cfg.mcp.servers[key] = cfg.mcp[key];
+    delete cfg.mcp[key];
+  }
+}
+cfg.mcp.servers["harness-tools"] = {
   type: "local",
   command: [
     path.join(TOOLS_DIR, "venv", "bin", "python"),
     path.join(TOOLS_DIR, "server.py"),
   ],
-  enabled: true,
+  disabled: false,
 };
 
-if (!cfg.provider) {
-  cfg.provider = {
+// ── Providers: V2 shape ──
+// Migrate V1 `provider` → V2 `providers`
+if (cfg.provider && !cfg.providers) {
+  cfg.providers = {};
+  for (const [name, spec] of Object.entries(cfg.provider)) {
+    const p = {};
+    if (spec.name) p.name = spec.name;
+    const npm = spec.npm || "@ai-sdk/openai-compatible";
+    p.package = npm.replace(
+      "@ai-sdk/openai-compatible",
+      "@opencode/ai/providers/openai-compatible"
+    );
+    if (spec.options) p.settings = spec.options;
+    if (spec.models)  p.models   = spec.models;
+    if (spec.env)     p.env      = spec.env;
+    cfg.providers[name] = p;
+  }
+  delete cfg.provider;
+}
+
+if (!cfg.providers) {
+  cfg.providers = {
     openrouter: {
-      npm: "@ai-sdk/openai-compatible",
-      options: { baseURL: "https://openrouter.ai/api/v1" },
+      package: "@opencode/ai/providers/openai-compatible",
+      settings: { baseURL: "https://openrouter.ai/api/v1" },
     },
     "orca-router": {
-      npm: "@ai-sdk/openai-compatible",
-      options: { baseURL: "https://orcarouter.xyz/api/v1" },
+      package: "@opencode/ai/providers/openai-compatible",
+      settings: { baseURL: "https://orcarouter.xyz/api/v1" },
     },
     "nvda-gate": {
-      npm: "@ai-sdk/openai-compatible",
-      options: { baseURL: "https://nvidia.com/api/v1" },
+      package: "@opencode/ai/providers/openai-compatible",
+      settings: { baseURL: "https://nvidia.com/api/v1" },
     },
   };
   info("Wrote default providers (none existed).");
@@ -276,8 +333,15 @@ if (!cfg.provider) {
   info("Existing providers preserved.");
 }
 
-if (!cfg.agent) {
-  cfg.agent = {
+// ── Agents: V2 shape ──
+// Migrate V1 `agent` → V2 `agents`
+if (cfg.agent && !cfg.agents) {
+  cfg.agents = cfg.agent;
+  delete cfg.agent;
+}
+
+if (!cfg.agents) {
+  cfg.agents = {
     primary: {
       description: "Primary coding agent using Harness-Optimizer tools.",
       model: "openrouter/deepseek/deepseek-chat",
@@ -354,33 +418,53 @@ for (const cmd of ["plan.md", "config.md", "rollback-confirm.md", "help-harness.
 head("Phase: Global AGENTS.md");
 const agentsSrc = path.join(__dirname, "..", "templates", "AGENTS.md");
 const agentsDst = path.join(CONFIG_DIR, "AGENTS.md");
-if (!fs.existsSync(agentsDst) || FLAGS.force) {
+const agentsBackup = path.join(CONFIG_DIR, "AGENTS.md.harness-backup");
+
+if (!fs.existsSync(agentsDst)) {
   fs.copyFileSync(agentsSrc, agentsDst);
   info("Installed global AGENTS.md");
-} else warn("AGENTS.md exists — preserved. Delete it and re-run to replace.");
-
+} else if (FLAGS.force) {
+  if (!fs.existsSync(agentsBackup)) {
+    fs.copyFileSync(agentsDst, agentsBackup);
+    info("Backed up existing AGENTS.md → AGENTS.md.harness-backup");
+  }
+  fs.copyFileSync(agentsSrc, agentsDst);
+  info("Overwrote global AGENTS.md (backup saved).");
+} else {
+  warn("AGENTS.md exists — preserved. Delete it and re-run to replace.");
+}
 head("Phase: OpenCode Plugins via npm");
 for (const pkg of ["opencode-runtime-fallback", "opencode-context-watch", "opencode-studio-server"]) {
   info(`Installing ${pkg}...`);
   const r = spawnSync("npm", ["install", "-g", pkg], { stdio: "inherit" });
   if (r.status !== 0) warn(`${pkg} install failed — install manually later.`);
 }
-
 head("Phase: Documentation");
 const docsSrc = path.join(__dirname, "..", "docs");
 const docsDst = path.join(TOOLS_DIR, "docs");
 fs.mkdirSync(docsDst, { recursive: true });
 if (fs.existsSync(docsSrc)) {
-  fs.cpSync(docsSrc, docsDst, { recursive: true });
-  info(`Docs installed → ${docsDst}`);
+  const realSrc = fs.realpathSync(docsSrc);
+  const realDst = fs.realpathSync(docsDst);
+  if (realSrc === realDst) {
+    info(`Docs already in place → ${docsDst} (skipped copy)`);
+  } else {
+    fs.cpSync(docsSrc, docsDst, { recursive: true });
+    info(`Docs installed → ${docsDst}`);
+  }
 }
-
 const studioSrc = path.join(__dirname, "..", "studio_extensions");
 const studioDst = path.join(TOOLS_DIR, "studio_extensions");
 if (fs.existsSync(studioSrc)) {
   fs.mkdirSync(studioDst, { recursive: true });
-  fs.cpSync(studioSrc, studioDst, { recursive: true });
-  info("Studio extension written.");
+  const realSrc = fs.realpathSync(studioSrc);
+  const realDst = fs.realpathSync(studioDst);
+  if (realSrc === realDst) {
+    info("Studio extension already in place (skipped copy)");
+  } else {
+    fs.cpSync(studioSrc, studioDst, { recursive: true });
+    info("Studio extension written.");
+  }
 }
 
 console.log("");

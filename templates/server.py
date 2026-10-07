@@ -9,6 +9,7 @@ Environment:
 """
 import ast
 import os
+import re
 import shlex
 import sqlite3
 import subprocess
@@ -19,12 +20,12 @@ mcp = FastMCP("HarnessTools")
 
 # ── Tool toggle ─────────────────────────────────────────────
 _raw = os.environ.get("HARNESS_TOOLS", "all").strip().lower()
-if _raw in {"", "all"}:
+if _raw in {"", "none"}:
+    _ENABLED = set()
+elif _raw == "all":
     _ENABLED = None
 else:
     _ENABLED = {t.strip() for t in _raw.split(",") if t.strip()}
-
-
 def enabled(name: str) -> bool:
     return _ENABLED is None or name in _ENABLED
 
@@ -60,50 +61,70 @@ async def emit_metric(ctx: Context, tool: str, saved: int, baseline: int, actual
 # ═══════════════════════════════════════════════════════════
 
 @register("get_repo_skeleton")
-async def get_repo_skeleton(repo_path: str, ctx: Context) -> str:
-    """Map Python code structure with AST. Returns class names, function
-    signatures, and file paths — NOT full file bodies. Call this first
-    before reading any source file."""
-    if not os.path.exists(repo_path):
-        return f"Error: Path {repo_path} does not exist."
+async def get_repo_skeleton(repo_path: str = ".", max_files: int = 500):
+    import ast
+    root = os.path.abspath(os.path.expanduser(repo_path))
+    if not os.path.isdir(root):
+        return f"ERROR: Not a directory: {root}"
 
-    skeleton: list[str] = []
+    SKIP_DIRS = {".git", "venv", ".venv", "env", "__pycache__",
+                 "node_modules", "dist", "build", ".tox", ".mypy_cache",
+                 ".pytest_cache", "site-packages"}
+
+    skeleton_lines = []
     total_raw_chars = 0
+    file_count = 0
 
-    for root, _, files in os.walk(repo_path):
-        if any(p in root for p in ["venv", ".git", "__pycache__", "node_modules"]):
-            continue
-        for file in sorted(files):
-            if not file.endswith(".py"):
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for fname in filenames:
+            if not fname.endswith(".py"):
                 continue
-            file_path = os.path.join(root, file)
-            rel_path = os.path.relpath(file_path, repo_path)
-            skeleton.append(f"\n📁 FILE: {rel_path}")
+            if file_count >= max_files:
+                break
+            file_count += 1
+            fpath = os.path.join(dirpath, fname)
+            rel = os.path.relpath(fpath, root)
             try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    raw_data = f.read()
-                total_raw_chars += len(raw_data)
-                tree = ast.parse(raw_data, filename=file_path)
-                for node in tree.body:
-                    if isinstance(node, ast.ClassDef):
-                        skeleton.append(f"  class {node.name}:")
-                        for sub in node.body:
-                            if isinstance(sub, ast.FunctionDef):
-                                args = [a.arg for a in sub.args.args]
-                                skeleton.append(f"    def {sub.name}({', '.join(args)}):")
-                    elif isinstance(node, ast.FunctionDef):
-                        args = [a.arg for a in node.args.args]
-                        skeleton.append(f"  def {node.name}({', '.join(args)}):")
-            except Exception as exc:
-                skeleton.append(f"  [Parse Error: {exc}]")
+                with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                    src = f.read()
+                total_raw_chars += len(src)
+                tree = ast.parse(src)
+            except (SyntaxError, OSError):
+                skeleton_lines.append(f"{rel}: (parse failed)")
+                continue
 
-    text = "\n".join(skeleton)
+            skeleton_lines.append(f"{rel}:")
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef):
+                    skeleton_lines.append(f"  class {node.name}:")
+                    for sub in node.body:
+                        if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            args = [a.arg for a in sub.args.args]
+                            skeleton_lines.append(
+                                f"    def {sub.name}({', '.join(args)}):"
+                            )
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    # Skip methods: already handled inside ClassDef
+                    if any(isinstance(p, ast.ClassDef) for p in ast.walk(tree)
+                           if hasattr(p, "body") and node in getattr(p, "body", [])):
+                        continue
+                    args = [a.arg for a in node.args.args]
+                    skeleton_lines.append(
+                        f"  def {node.name}({', '.join(args)}):"
+                    )
+
+    skeleton_text = "\n".join(skeleton_lines)
+
     baseline = estimate_tokens(" " * total_raw_chars)
-    actual = estimate_tokens(text)
+    actual = estimate_tokens(skeleton_text)
     saved = max(0, baseline - actual)
-    metric = await emit_metric(ctx, "get_repo_skeleton", saved, baseline, actual)
-    return text + "\n\n" + metric
+    metric = (
+        f"[TOKEN METRIC] tool=get_repo_skeleton "
+        f"saved={saved} baseline={baseline} actual={actual}"
+    )
 
+    return skeleton_text + "\n\n" + metric
 
 @register("rip_file_lines")
 async def rip_file_lines(file_path: str, start_line: int, end_line: int, ctx: Context) -> str:
@@ -165,35 +186,32 @@ async def find_dependent_references(target_symbol: str, repo_path: str) -> str:
 # ═══════════════════════════════════════════════════════════
 
 @register("apply_search_replace")
-async def apply_search_replace(
-    file_path: str, search_block: str, replace_block: str, ctx: Context
-) -> str:
-    """Swap an exact block of code for a new one. First occurrence only.
-    The search_block must match byte-for-byte including indentation."""
-    if not os.path.exists(file_path):
-        return f"Error: File {file_path} not found."
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            content = f.read()
-
-        if search_block not in content:
-            return (
-                "Error: TARGET SEARCH BLOCK NOT FOUND EXACTLY. "
-                "Check spacing, indentation, and line endings."
-            )
-
-        updated = content.replace(search_block, replace_block, 1)
-        with open(file_path, "w", encoding="utf-8") as f:
-            f.write(updated)
-
-        full_rewrite = estimate_tokens(updated)
-        patch = estimate_tokens(search_block + replace_block)
-        saved = max(0, full_rewrite - patch)
-        metric = await emit_metric(ctx, "apply_search_replace", saved, full_rewrite, patch)
-        return "Surgical replacement applied successfully.\n\n" + metric
-    except Exception as exc:
-        return f"Replacement engine exception: {exc}"
-
+async def apply_search_replace(file_path: str, search_block: str, replace_block: str):
+    path = os.path.expanduser(file_path)
+    if not os.path.exists(path):
+        return f"ERROR: File not found: {path}"
+        
+    if not search_block.strip():
+        return "ERROR: Search block cannot be empty or whitespace only."
+        
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+        
+    count = content.count(search_block)
+    if count == 0:
+        return f"ERROR: TARGET SEARCH BLOCK NOT FOUND EXACTLY in {path}"
+    if count > 1:
+        return f"ERROR: Search block matches {count} locations. Please provide more context to make it unique."
+        
+    new_content = content.replace(search_block, replace_block, 1)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(new_content)
+        
+    full_rewrite = estimate_tokens(new_content)
+    patch = estimate_tokens(search_block + replace_block)
+    saved = max(0, full_rewrite - patch)
+    metric = f"[TOKEN METRIC] tool=apply_search_replace saved={saved} baseline={full_rewrite} actual={patch}"
+    return "Surgical replacement applied successfully.\n\n" + metric
 
 # ═══════════════════════════════════════════════════════════
 # C. Safety and version control
@@ -215,29 +233,47 @@ async def lint_file(file_path: str) -> str:
 
 
 @register("git_checkpoint")
-async def git_checkpoint(file_path: str, change_summary: str) -> str:
-    """Stage and commit a single file with a descriptive message.
-    Call only at meaningful milestones, not after every edit."""
-    repo_dir = os.path.dirname(os.path.abspath(file_path))
-    try:
-        subprocess.run(
-            ["git", "add", file_path], cwd=repo_dir,
-            check=True, shell=False,
+async def git_checkpoint(file_path: str, change_summary: str):
+    import subprocess
+    path = os.path.abspath(os.path.expanduser(file_path))
+    repo_dir = os.path.dirname(path)
+    
+    # Check if there are other staged files before we commit
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True
+    )
+    # Porcelain output for staged files begins with characters like 'M ', 'A ', 'D ', 'R '
+    staged_files = [
+        line[3:].strip() for line in status.stdout.splitlines()
+        if len(line) > 3 and line[0] not in (' ', '?')
+    ]
+    
+    rel_path = os.path.relpath(path, repo_dir)
+    
+    if staged_files and staged_files != [rel_path]:
+        return (
+            "ERROR: Unrelated staged files detected. "
+            "Please commit or unstage them before using git_checkpoint.\n"
+            f"Staged files: {', '.join(staged_files)}"
         )
-        status = subprocess.run(
-            ["git", "status", "--porcelain"], cwd=repo_dir,
-            capture_output=True, text=True, shell=False,
-        )
-        if not status.stdout.strip():
-            return "Nothing to commit — file unchanged since last commit."
-        subprocess.run(
-            ["git", "commit", "-m", f"[harness] {change_summary}"],
-            cwd=repo_dir, check=True, shell=False,
-        )
-        return f"Committed: {change_summary}"
-    except Exception as exc:
-        return f"Git checkpoint failed: {exc}"
-
+        
+    subprocess.run(["git", "add", rel_path], cwd=repo_dir)
+    
+    # Use '-- <path>' to commit ONLY this file, ignoring any other staged changes
+    result = subprocess.run(
+        ["git", "commit", "-m", f"[harness] {change_summary}", "--", rel_path],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True
+    )
+    
+    if result.returncode != 0:
+        return f"ERROR: Commit failed:\n{result.stderr}\n{result.stdout}"
+        
+    return f"Committed: {change_summary}"
 
 @register("rollback_show")
 async def rollback_show(repo_path: str) -> str:
@@ -295,37 +331,93 @@ async def rollback_show(repo_path: str) -> str:
 # D. Execution and introspection
 # ═══════════════════════════════════════════════════════════
 
-@register("execute_and_capture")
-async def execute_and_capture(command: str, timeout_seconds: int = 15) -> str:
-    """Run a whitelisted command. Output is clipped to 30 head + 30 tail
-    lines to prevent token burn. Uses shell=False — no command injection."""
-    parts = shlex.split(command)
+# ── Bypass guard for execute_and_capture ──
+# The whitelist is a convenience filter, NOT a sandbox. Interpreters like
+# python3 are Turing-complete and can write files or spawn subprocesses,
+# sidestepping the surgical edit tools. Refuse the most obvious cases so
+# apply_search_replace / OpenCode's native write tools are used instead.
+_BYPASS_PATTERNS = [
+    re.compile(r"\bopen\s*\([^)]*['\"][wa]['\"]"),
+    re.compile(r"\bos\.system\s*\("),
+    re.compile(r"\bsubprocess\.(run|Popen|call|check_output|check_call)"),
+    re.compile(r"\bshutil\.(rmtree|move|copy|copyfile)"),
+    re.compile(r"\bos\.(remove|unlink|rmdir|rename|chmod|chown|mkdir|makedirs)"),
+    re.compile(r"\.write_text\s*\(|\.write_bytes\s*\("),
+    re.compile(r"\bPath\s*\([^)]*\)\.(unlink|write_text|write_bytes)\s*\("),
+    re.compile(r"-exec\s+(rm|mv|cp|sh|bash|python|perl)"),
+    re.compile(r"(?<!\w)-delete(?!\w)"),
+]
+
+def _bypass_reason(parts: list):
+    """Return a reason string if a whitelisted command is being abused
+    as a shell escape hatch. Best-effort, not a security boundary."""
     if not parts:
-        return "Error: empty command."
-    if parts[0] not in ALLOWED_COMMANDS:
-        return (
-            f"Error: '{parts[0]}' is not whitelisted. "
-            f"Allowed: {', '.join(sorted(ALLOWED_COMMANDS))}"
-        )
+        return None
+    binname = parts[0]
+    joined = " ".join(parts[1:])
+    if binname in ("python", "python3"):
+        if "-c" in parts:
+            for pat in _BYPASS_PATTERNS:
+                if pat.search(joined):
+                    return f"refused: python -c matches dangerous pattern ({pat.pattern})"
+    if binname == "find":
+        for pat in _BYPASS_PATTERNS:
+            if pat.search(joined):
+                return f"refused: find argument matches dangerous pattern ({pat.pattern})"
+    if binname == "git":
+        if "config" in parts and ("--global" in parts or "--system" in parts):
+            return "refused: git config --global is not permitted via execute_and_capture"
+    return None
+
+@register("execute_and_capture")
+async def execute_and_capture(command: str, timeout_seconds: int = 15):
+    import shlex
+    import subprocess
+    parts = shlex.split(command)
+    if not parts or parts[0] not in ALLOWED_COMMANDS:
+        return f"ERROR: Command '{parts[0] if parts else ''}' is not allowed. Allowed: {', '.join(ALLOWED_COMMANDS)}"
+    
+    reason = _bypass_reason(parts)
+    if reason:
+        return f"ERROR: {reason}"
+    
     try:
-        res = subprocess.run(
-            parts, capture_output=True, text=True,
-            timeout=timeout_seconds, shell=False,
+        result = subprocess.run(
+            parts,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            shell=False
         )
-        raw = f"{res.stdout}\n{res.stderr}".strip()
-        lines = raw.splitlines()
+        output = result.stdout + "\n" + result.stderr
+        lines = output.splitlines()
+        
+        response = [
+            f"Exit code: {result.returncode}",
+            f"Timed out: no",
+            f"Output truncated: {'yes' if len(lines) > 60 else 'no'}"
+        ]
+        
         if len(lines) > 60:
-            return "\n".join(
+            truncated = "\n".join(
                 lines[:30]
                 + ["\n... [ LOGS CLIPPED TO PREVENT TOKEN BURN ] ...\n"]
                 + lines[-30:]
             )
-        return raw if raw else "Execution completed with zero logs."
+            response.append("Relevant output:\n" + truncated)
+        else:
+            response.append("Relevant output:\n" + output)
+            
+        return "\n".join(response)
+        
     except subprocess.TimeoutExpired:
-        return f"CRITICAL: timed out after {timeout_seconds}s."
-    except Exception as exc:
-        return f"Process failure: {exc}"
-
+        return (
+            "Exit code: -1\n"
+            "Timed out: yes\n"
+            "Output truncated: no\n"
+            "Relevant output:\n"
+            f"Command timed out after {timeout_seconds} seconds."
+        )
 
 @register("inspect_database_schema")
 async def inspect_database_schema(db_path: str) -> str:

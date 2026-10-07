@@ -9,13 +9,13 @@
 
 ## Token Metric Reporting
 When a harness-tools call returns text containing a `[TOKEN METRIC]` line,
-you MUST echo that exact line to the user verbatim, on its own line,
-before continuing with your reply. Format:
+include that line verbatim in your reply when it is easy to do so:
 
     💰 <tool_name>: saved <N> tokens (<baseline> baseline → <actual> actual)
 
-Do not summarize it. Do not omit it. The user relies on this line to
-track token savings visually during the session.
+Do not summarize or fabricate the numbers. The token-metrics plugin also
+records every metric to `~/.config/opencode/.harness-token-metrics.log`, so
+skipping the line in chat is acceptable — never invent a replacement.
 
 ## Context Pressure Protocol
 When context-watch warns you, STOP and produce a Context Checkpoint Report:
@@ -32,6 +32,18 @@ Do NOT continue after the report unless the user says so.
 ## Model Fallback
 If fallback switches models mid-task, you still have full history.
 Do not re-read files or re-run tests. Continue where the previous model left off.
+
+
+## No Shell Bypass of Refused Edits
+If a harness-tools edit is refused (ambiguous search, empty search, missing
+target, safety guard), do NOT try to accomplish the same edit via
+`execute_and_capture` with `python3 -c`, `sed -i`, `perl -i`, or similar.
+The refusal is intentional.
+
+Instead:
+- Add more unique context to `apply_search_replace`
+- Use OpenCode's native `edit` tool
+- Ask the user how to proceed
 
 ## Plan Mode
 When the user types `/plan <task>`, produce a written implementation plan
@@ -50,3 +62,5 @@ yourself. Let the user decide whether to roll back and how.
 If you are unsure whether a recently edited MCP tool file (`server.py`)
 is loaded, tell the user to restart OpenCode. You cannot reload the MCP
 server mid-session.
+
+
