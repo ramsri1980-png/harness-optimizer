@@ -3,7 +3,7 @@ const { execSync, spawnSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
-
+const crypto = require("crypto");
 const HOME = os.homedir();
 const TOOLS_DIR = path.join(HOME, "developer", "harness-optimizer");
 const CONFIG_DIR = path.join(HOME, ".config", "opencode");
@@ -22,6 +22,21 @@ const FLAGS = {
   force:     process.argv.includes("--force"),
   help:      process.argv.includes("--help") || process.argv.includes("-h"),
 };
+// ── Helpers ──
+function sha256(buf) {
+  return crypto.createHash("sha256").update(buf).digest("hex");
+}
+
+function readMarkerHash(markerPath) {
+  if (!fs.existsSync(markerPath)) return null;
+  try {
+    const raw = fs.readFileSync(markerPath, "utf8").trim();
+    const parsed = JSON.parse(raw);
+    return parsed.hash || null;
+  } catch {
+    return null;
+  }
+}
 
 const C = {
   g: "\x1b[32m", y: "\x1b[33m", r: "\x1b[31m",
@@ -124,19 +139,50 @@ if (FLAGS.uninstall) {
   ]) {
     if (fs.existsSync(f)) { fs.rmSync(f); info(`Removed ${f}`); }
   }
-  // AGENTS.md: three cases — restore backup, remove harness-owned, or leave user's alone
+
+  // AGENTS.md: uninstall decision tree
+  //   - We created it, unchanged   → remove (or restore backup if any)
+  //   - We created it, user edited → preserve, leave backup on disk
+  //   - User-owned, we never wrote → leave alone
+  //   - Legacy marker without hash → assume we own it (backward compat)
   const agentsDst = path.join(CONFIG_DIR, "AGENTS.md");
   const agentsBackup = path.join(CONFIG_DIR, "AGENTS.md.harness-backup");
   const agentsMarker = path.join(CONFIG_DIR, ".harness-owns-agents");
-  if (fs.existsSync(agentsBackup)) {
+
+  const storedHash = readMarkerHash(agentsMarker);
+  const markerExists = fs.existsSync(agentsMarker);
+  const currentContent = fs.existsSync(agentsDst) ? fs.readFileSync(agentsDst) : null;
+  const currentHash = currentContent ? sha256(currentContent) : null;
+
+  // Legacy marker (no hash) → treat as "we own it, unknown state" → proceed with removal.
+  // New marker → only remove if the file is untouched since we wrote it.
+  const weOwnItUnchanged = markerExists && (storedHash === null || storedHash === currentHash);
+  const weOwnItButUserEdited = markerExists && storedHash !== null && storedHash !== currentHash;
+
+  if (weOwnItUnchanged) {
+    if (fs.existsSync(agentsBackup)) {
+      fs.copyFileSync(agentsBackup, agentsDst);
+      fs.rmSync(agentsBackup);
+      fs.rmSync(agentsMarker);
+      info("Restored your original AGENTS.md from backup.");
+    } else if (fs.existsSync(agentsDst)) {
+      fs.rmSync(agentsDst);
+      fs.rmSync(agentsMarker);
+      info("Removed harness-created AGENTS.md.");
+    } else if (fs.existsSync(agentsMarker)) {
+      fs.rmSync(agentsMarker);
+    }
+  } else if (weOwnItButUserEdited) {
+    info("AGENTS.md has been edited since install — leaving in place.");
+    if (fs.existsSync(agentsBackup)) {
+      info(`Your pre-install backup is preserved at: ${agentsBackup}`);
+    }
+    fs.rmSync(agentsMarker);
+  } else if (fs.existsSync(agentsBackup)) {
+    // No marker, but we have a backup from an earlier --force run.
     fs.copyFileSync(agentsBackup, agentsDst);
     fs.rmSync(agentsBackup);
-    if (fs.existsSync(agentsMarker)) fs.rmSync(agentsMarker);
     info("Restored your original AGENTS.md from backup.");
-  } else if (fs.existsSync(agentsMarker)) {
-    if (fs.existsSync(agentsDst)) fs.rmSync(agentsDst);
-    fs.rmSync(agentsMarker);
-    info("Removed harness-created AGENTS.md.");
   } else {
     info("AGENTS.md not owned by harness — left in place.");
   }
@@ -303,13 +349,21 @@ for (const key of Object.keys(cfg.mcp)) {
     delete cfg.mcp[key];
   }
 }
+
+// Merge into any existing harness-tools entry — do not blow away user
+// choices (environment.HARNESS_TOOLS, disabled state, custom fields).
+const existingHarnessTools = cfg.mcp.servers["harness-tools"] || {};
 cfg.mcp.servers["harness-tools"] = {
+  ...existingHarnessTools,
   type: "local",
   command: [
     path.join(TOOLS_DIR, "venv", "bin", "python"),
     path.join(TOOLS_DIR, "server.py"),
   ],
-  disabled: false,
+  // Preserve the user's disabled flag if set; default to false only on first install
+  disabled: existingHarnessTools.disabled !== undefined
+    ? existingHarnessTools.disabled
+    : false,
 };
 
 // ── Providers: V2 shape ──
@@ -442,7 +496,11 @@ const agentsMarker = path.join(CONFIG_DIR, ".harness-owns-agents");
 
 if (!fs.existsSync(agentsDst)) {
   fs.copyFileSync(agentsSrc, agentsDst);
-  fs.writeFileSync(agentsMarker, new Date().toISOString() + "\n");
+  const content = fs.readFileSync(agentsDst);
+  fs.writeFileSync(agentsMarker, JSON.stringify({
+    hash: sha256(content),
+    installedAt: new Date().toISOString(),
+  }, null, 2) + "\n");
   info("Installed global AGENTS.md (harness-owned).");
 } else if (FLAGS.force) {
   if (!fs.existsSync(agentsBackup)) {
@@ -450,7 +508,11 @@ if (!fs.existsSync(agentsDst)) {
     info("Backed up existing AGENTS.md → AGENTS.md.harness-backup");
   }
   fs.copyFileSync(agentsSrc, agentsDst);
-  fs.writeFileSync(agentsMarker, new Date().toISOString() + "\n");
+  const content = fs.readFileSync(agentsDst);
+  fs.writeFileSync(agentsMarker, JSON.stringify({
+    hash: sha256(content),
+    installedAt: new Date().toISOString(),
+  }, null, 2) + "\n");
   info("Overwrote global AGENTS.md (backup saved, harness-owned).");
 } else {
   warn("AGENTS.md exists — preserved. Delete it and re-run to replace.");

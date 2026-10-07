@@ -1,11 +1,27 @@
 # Global Rules (all OpenCode sessions)
 
 ## Token Protocol
-- ALWAYS call `get_repo_skeleton` before reading any source file
-- Use `rip_file_lines` for targeted reads — NEVER read full files
-- Use `apply_search_replace` for edits — NEVER rewrite full files
-- Run `lint_file` after every code change
-- Only call `git_checkpoint` at meaningful milestones
+Use the smallest sufficient context — not the smallest possible excerpt.
+
+- **Mapping**: use `get_repo_skeleton` when relevant code locations or
+  relationships are unclear. Do not require a map before every read. If
+  the relevant file is already known, read it directly.
+- **Reading**: read the smallest sufficient context — normally a complete
+  function, logical block, or file section plus necessary surrounding
+  context. Full reads of small files are allowed. Expand context when
+  dependencies or behavior are unclear.
+- **Editing**: prefer `apply_search_replace` for surgical block edits.
+  Use OpenCode's native `edit` tool when it provides equivalent safety
+  with less work. Never rewrite a full file to make a small change.
+- **Tool selection**: use harness tools or native OpenCode tools according
+  to which is more effective and safer for the task. Do not force a
+  harness tool merely to produce a savings metric.
+- **Verification**: run language-appropriate checks and relevant tests
+  after each coherent change. Preserve required regression tests and
+  final acceptance checks. Reuse earlier evidence only while it remains
+  applicable and current.
+- **Milestones**: call `git_checkpoint` at meaningful milestones, not
+  after every edit.
 
 ## Token Metric Reporting
 When a harness-tools call returns text containing a `[TOKEN METRIC]` line,

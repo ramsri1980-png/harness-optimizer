@@ -398,39 +398,46 @@ async def execute_and_capture(command: str, timeout_seconds: int = 15):
             timeout=timeout_seconds,
             shell=False
         )
-
         output = result.stdout + "\n" + result.stderr
+        raw_len = len(output)
         lines = output.splitlines()
         over_lines = len(lines) > MAX_OUTPUT_LINES
-        over_chars = len(output) > MAX_OUTPUT_CHARS
+        over_chars = raw_len > MAX_OUTPUT_CHARS
+
+        # Apply limits cumulatively: trim lines first, then apply char cap.
+        # Metadata notes are collected BEFORE the payload so they survive
+        # any downstream char truncation.
+        kept = output
+        limit_notes = []
+
+        if over_lines:
+            kept = "\n".join(
+                lines[: MAX_OUTPUT_LINES // 2]
+                + [f"... [ LOGS CLIPPED: line limit reached ({len(lines)} lines > {MAX_OUTPUT_LINES}) ] ..."]
+                + lines[-(MAX_OUTPUT_LINES // 2):]
+            )
+            limit_notes.append(f"line limit reached ({len(lines)} lines > {MAX_OUTPUT_LINES})")
+
+        if len(kept) > MAX_OUTPUT_CHARS:
+            half = MAX_OUTPUT_CHARS // 2
+            dropped = len(kept) - MAX_OUTPUT_CHARS
+            kept = (
+                kept[:half]
+                + f"\n... [ CLIPPED: {dropped} chars dropped to stay under {MAX_OUTPUT_CHARS} ] ...\n"
+                + kept[-half:]
+            )
+            limit_notes.append(f"{dropped} chars dropped to stay under {MAX_OUTPUT_CHARS}")
 
         response = [
             f"Exit code: {result.returncode}",
             f"Timed out: no",
-            f"Output truncated: {'yes' if (over_lines or over_chars) else 'no'}",
+            f"Output truncated: {'yes' if limit_notes else 'no'}",
         ]
+        if limit_notes:
+            response.append("Applied limits: " + "; ".join(limit_notes))
+        response.append("Relevant output:\n" + kept)
 
-        if over_lines:
-            truncated = "\n".join(
-                lines[: MAX_OUTPUT_LINES // 2]
-                + ["\n... [ LOGS CLIPPED: line limit reached ] ...\n"]
-                + lines[-(MAX_OUTPUT_LINES // 2):]
-            )
-            response.append("Relevant output:\n" + truncated)
-        elif over_chars:
-            half = MAX_OUTPUT_CHARS // 2
-            head = output[:half]
-            tail = output[-half:]
-            dropped = len(output) - MAX_OUTPUT_CHARS
-            response.append(
-                "Relevant output:\n"
-                + head
-                + f"\n... [ CLIPPED: {dropped} chars dropped to stay under {MAX_OUTPUT_CHARS} ] ...\n"
-                + tail
-            )
-        else:
-            response.append("Relevant output:\n" + output)
-
+        return "\n".join(response)
         return "\n".join(response)
 
     except subprocess.TimeoutExpired:
