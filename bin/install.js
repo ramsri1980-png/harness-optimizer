@@ -63,12 +63,24 @@ function need(cmd, why) {
 // ── Uninstall ─────────────────────────────────────────────
 if (FLAGS.uninstall) {
   head("Uninstalling Harness-Optimizer");
-  if (fs.existsSync(TOOLS_DIR)) {
-    fs.rmSync(TOOLS_DIR, { recursive: true, force: true });
-    info(`Removed ${TOOLS_DIR}`);
-  } else {
-    info("Tools directory already absent.");
+  // Never rm -rf the whole tools directory — it may be the user's git
+  // checkout. Only remove installer-created runtime artifacts.
+  const runtimeArtifacts = [
+    path.join(TOOLS_DIR, "venv"),
+    path.join(TOOLS_DIR, "server.py"),
+    path.join(TOOLS_DIR, "harness-config-ui.py"),
+  ];
+  const isUserCheckout = fs.existsSync(path.join(TOOLS_DIR, ".git"));
+  for (const f of runtimeArtifacts) {
+    if (fs.existsSync(f)) {
+      fs.rmSync(f, { recursive: true, force: true });
+      info(`Removed ${f}`);
+    }
   }
+  if (isUserCheckout) {
+    info(`Preserved ${TOOLS_DIR} (git checkout — not deleting repository)`);
+  }
+
   if (fs.existsSync(OPENCODE_JSON)) {
     try {
       const cfg = JSON.parse(fs.readFileSync(OPENCODE_JSON, "utf8"));
