@@ -15,9 +15,18 @@ Use the smallest sufficient context — not the smallest possible excerpt.
 - **Editing**: prefer `apply_search_replace` for surgical block edits.
   Use OpenCode's native `edit` tool when it provides equivalent safety
   with less work. Never rewrite a full file to make a small change.
-- **Tool selection**: use harness tools or native OpenCode tools according
-  to which is more effective and safer for the task. Do not force a
-  harness tool merely to produce a savings metric.
+- **Tool selection**: use the smallest sufficient tool. Prefer harness
+  tools when the task pattern matches:
+  - Reading a specific line range of a large file → `rip_file_lines`
+  - Understanding structure without full contents → `get_repo_skeleton`
+  - Finding where a symbol is used → `find_dependent_references`
+  - Surgical block edit with unique context → `apply_search_replace`
+  Use native tools when:
+  - The file is small (full read is cheap)
+  - You need the whole file to reason
+  - You're exploring without a specific target
+  Never force a harness tool merely to produce a savings metric, and never
+  bypass a refused operation or permission restriction.
 - **Verification**: run language-appropriate checks and relevant tests
   after each coherent change. Preserve required regression tests and
   final acceptance checks. Reuse earlier evidence only while it remains
