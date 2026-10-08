@@ -63,25 +63,40 @@ or rerun checks when relevant state changed, evidence is missing, or
 correctness is uncertain. Do not blindly redo everything, and do not blindly
 trust stale evidence either.
 
+
 ## Requirement Verification
 For work against explicit requirements — a requirements doc, an OpenSpec
-change, or a user-provided spec — verify before claiming completion.
+change, or a user-provided spec — verify the completed scope before
+claiming completion. Read the identified requirements and acceptance
+scenarios. Report ambiguity rather than inventing expected behavior.
 
-- **If an approved OpenSpec change is active**, use `openspec verify` as
-  the authority. Do not invent a parallel verification pass.
-- **Otherwise**, for each requirement or acceptance scenario, report:
-  - **Code evidence** — file:line references and the actual execution
-    path (not just a matching function name)
-  - **Test evidence** — the test name, its assertion, and the exact
-    command run with exit code and result summary
-  - **Status** — one of: VERIFIED, FAIL, UNVERIFIED, BLOCKED BY AMBIGUITY
-- **UNVERIFIED** means: code exists but no test exercises the required
-  behavior. Report it honestly instead of claiming done.
-- Do NOT substitute syntax checks (`lint_file`) or "looks correct" for
-  behavioral evidence.
-- This is a **review** step — report findings only. Do not edit
-  implementation, tests, requirements, task checkboxes, or commit.
+**OpenSpec handling.** When an approved OpenSpec change is active, use
+the installed OpenSpec verification workflow — `/opsx-verify <change-name>`
+in OpenCode, or the `openspec-verify-change` skill. Keep that change's
+approved requirements as the source of truth. If the workflow is
+unavailable, report that and perform an evidence-based review of the
+same artifacts. Do not invent a CLI command or a second specification.
 
+**Evidence for both paths.** For each requirement or acceptance scenario,
+map it to its implementation location and the relevant test assertions
+or acceptance checks. Report exact executed commands, exit codes, and
+results. Distinguish executed checks from inspected tests. Use existing
+permissions and isolated test data.
+
+**Statuses.**
+- **VERIFIED** — current checks support the stated scenario.
+- **FAIL** — implementation or results contradict the requirement.
+- **UNVERIFIED** — evidence is missing, insufficient, stale, skipped,
+  or unavailable.
+- **BLOCKED BY AMBIGUITY** — expected behavior cannot be established.
+
+Do not present syntax compilation alone as behavioral verification.
+
+**Review boundaries.** Report findings in chat and stop. During
+verification, do not edit implementation, tests, requirements, or task
+checkboxes; do not commit, archive, or automatically repair findings.
+Do not claim completion while required behavior remains failed,
+blocked, or unverified.
 
 ## No Shell Bypass of Refused Edits
 If a harness-tools edit is refused (ambiguous search, empty search, missing
