@@ -1,6 +1,6 @@
 {
   "name": "harness-optimizer",
-  "version": "0.4.4",
+  "version": "0.5.0",
   "description": "One-command installer for the Harness-Optimizer MCP suite for OpenCode",
   "bin": {
     "harness-optimizer": "./bin/install.js"
