@@ -1029,6 +1029,126 @@ async def test_edit_no_op_detection():
               os.stat(f).st_mtime_ns == mtime_before)
 
 
+async def test_read_truncation_keeps_complete_lines():
+    print("\n[Test READ-09] rip_file_lines truncation preserves line prefixes (T02 fix)")
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "wide.py")
+        with open(f, "w") as fh:
+            for i in range(1, 61):
+                fh.write(f"line_{i:03d} = '" + "x" * 200 + "'\n")
+        r = await server.rip_file_lines(f, 1, 60, None)
+        check("Response <= 4000", len(r) <= 4000, f"len={len(r)}")
+        source_lines = [ln for ln in r.split("\n")
+                        if ln and not ln.startswith("#")
+                        and not ln.startswith("---")
+                        and not ln.startswith("    ")]
+        bad = [ln for ln in source_lines
+               if not ln.split(":", 1)[0].strip().isdigit()]
+        check("All source lines retain numeric prefix",
+              bad == [], str(bad[:3]))
+
+
+async def test_read_invalid_context_mode_rejected():
+    print("\n[Test READ-10] rip_file_lines rejects invalid context mode (T02 fix)")
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "sample.py")
+        with open(f, "w") as fh:
+            fh.write("def a():\n    pass\n")
+        r = await server.rip_file_lines(f, 1, 2, None, context="foo")
+        check("Invalid context mode rejected", "ERROR" in r.upper(), r[:200])
+
+
+async def test_read_invalid_utf8_disclosed():
+    print("\n[Test READ-11] rip_file_lines discloses invalid UTF-8 (T02 fix)")
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "bad_bytes.py")
+        with open(f, "wb") as fh:
+            fh.write(b"ok_line = 1\n")
+            fh.write(b"bad = \xff\xfe\n")
+        r = await server.rip_file_lines(f, 1, 2, None)
+        check("Invalid-UTF-8 note present", "invalid UTF-8" in r, r[:400])
+
+
+async def test_lint_timeout_preserves_partial_stderr():
+    print("\n[Test LINT-11] lint_file timeout preserves partial stderr (T05 fix)")
+    from unittest.mock import patch
+    import subprocess as sp
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "a.py")
+        with open(f, "w") as fh:
+            fh.write("pass\n")
+        exc = sp.TimeoutExpired("python3", 10)
+        exc.stderr = "Partial diagnostic from child\n"
+        with patch("server.subprocess.run", side_effect=exc):
+            r = await server.lint_file(f)
+        check("Timeout FAIL returned", "FAIL:" in r, r[:300])
+        check("Partial stderr preserved",
+              "Partial diagnostic" in r, r[:400])
+
+
+async def test_lint_no_generic_line_fallback():
+    print("\n[Test LINT-12] lint_file no generic line fallback (T05 fix)")
+    from unittest.mock import patch
+    from subprocess import CompletedProcess
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "valid.py")
+        with open(f, "w") as fh:
+            fh.write("pass\n")
+        fake = CompletedProcess(
+            args=["python3", "-m", "py_compile", f],
+            returncode=1, stdout="",
+            stderr="worker configuration error, line 1: invalid settings\n",
+        )
+        with patch("server.subprocess.run", return_value=fake):
+            r = await server.lint_file(f)
+        check("Generic 'line N' not treated as source location",
+              "valid.py:1" not in r, r[:400])
+        check("Falls back to (no location parsed)",
+              "(no location parsed)" in r, r[:400])
+
+
+async def test_lint_path_disambiguation():
+    print("\n[Test LINT-13] lint_file path disambiguation (T05 fix)")
+    from unittest.mock import patch
+    from subprocess import CompletedProcess
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "valid.py")
+        with open(f, "w") as fh:
+            fh.write("pass\n")
+        fake = CompletedProcess(
+            args=["python3", "-m", "py_compile", f],
+            returncode=1, stdout="",
+            stderr="/some/other/dir/valid.py:5: invalid syntax\n",
+        )
+        with patch("server.subprocess.run", return_value=fake):
+            r = await server.lint_file(f)
+        check("Different-directory same-basename not attributed",
+              "valid.py:5" not in r, r[:400])
+
+
+async def test_lint_source_change_during_compile_noted():
+    print("\n[Test LINT-14] lint_file source-change note (T05 fix)")
+    from unittest.mock import patch
+    from subprocess import CompletedProcess
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "valid.py")
+        with open(f, "w") as fh:
+            fh.write("def foo(:\n    pass\n")
+
+        def mutate_then_run(cmd, *args, **kwargs):
+            # Change file between compile and read
+            with open(f, "a") as fh:
+                fh.write("# external change\n")
+            return CompletedProcess(
+                args=cmd, returncode=1, stdout="",
+                stderr=f + ":1: SyntaxError: invalid syntax\n",
+            )
+        with patch("server.subprocess.run", side_effect=mutate_then_run):
+            r = await server.lint_file(f)
+        check("Source-change note present",
+              "source changed" in r.lower(), r[:500])
+
+
 async def main():
     print("=" * 60)
     print("Harness-Optimizer Fix Verification")
@@ -1090,6 +1210,13 @@ async def main():
     await test_edit_atomic_failure_cleanup()
     await test_edit_path_handling()
     await test_edit_no_op_detection()
+    await test_read_truncation_keeps_complete_lines()
+    await test_read_invalid_context_mode_rejected()
+    await test_read_invalid_utf8_disclosed()
+    await test_lint_timeout_preserves_partial_stderr()
+    await test_lint_no_generic_line_fallback()
+    await test_lint_path_disambiguation()
+    await test_lint_source_change_during_compile_noted()
 
 
     print("\n" + "=" * 60)

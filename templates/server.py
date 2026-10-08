@@ -162,6 +162,35 @@ _RIP_TAIL_LINES = 20           # source lines kept at tail when truncating
 _RIP_METRIC_RESERVE = 160      # conservative room for [TOKEN METRIC] line
 
 
+def _fit_lines(lines, budget):
+    """Return complete lines from `lines` whose joined length fits
+    within `budget`. Preserves order. Never slices a line."""
+    out = []
+    used = 0
+    for ln in lines:
+        add = len(ln) + (1 if out else 0)
+        if used + add > budget:
+            break
+        out.append(ln)
+        used += add
+    return out
+
+
+def _fit_or_mark(lines, budget, inline=" ... [truncated] ..."):
+    """_fit_lines, with one documented exception: when the next line
+    alone exceeds `budget`, keep that line's leading slice with an
+    explicit in-line marker instead of silently dropping it. The numeric
+    prefix sits at the start of every line, so it survives the slice."""
+    out = _fit_lines(lines, budget)
+    if len(out) < len(lines):
+        nxt = lines[len(out)]
+        if len(nxt) > budget:
+            room = budget - len(inline) - (1 if out else 0)
+            if room > 0:
+                out = out + [nxt[:room] + inline]
+    return out
+
+
 def _enclosing_definition(lines, start_line):
     """Innermost class/function containing start_line, as (kind, name,
     def_start, def_end). def_start includes decorator lines. None if the
@@ -228,6 +257,8 @@ async def rip_file_lines(file_path: str, start_line: int, end_line: int, ctx: Co
         return f"ERROR: {file_path} is a directory, not a file"
     if start_line < 1 or end_line < start_line:
         return "ERROR: invalid range — start_line must be >= 1 and end_line >= start_line"
+    if context not in ("raw", "enclosing"):
+        return f"ERROR: unsupported context mode '{context}' - use 'raw' or 'enclosing'"
 
     basename = os.path.basename(file_path)
     try:
@@ -238,6 +269,8 @@ async def rip_file_lines(file_path: str, start_line: int, end_line: int, ctx: Co
 
     fingerprint = hashlib.sha256(raw_bytes).hexdigest()
     text = raw_bytes.decode("utf-8", errors="replace")
+    # Disclose any substitution so the caller knows the view is lossy.
+    utf8_lossy = "\ufffd" in text
     # Split on \n and drop a single trailing \r per line; a trailing
     # newline does not create an extra phantom line.
     lines = text.split("\n")
@@ -295,7 +328,13 @@ async def rip_file_lines(file_path: str, start_line: int, end_line: int, ctx: Co
 
     header = f"--- Lines {start_line} to {end_line} of {total} ---"
     body = [f"{idx}: {lines[idx - 1]}" for idx in range(start_line, end_line + 1)]
-    head_lines = [header, f"# sha256: {fingerprint}"] + notes
+    head_lines = [header, f"# sha256: {fingerprint}"]
+    if utf8_lossy:
+        head_lines.append(
+            "# note: file contained invalid UTF-8; some bytes were "
+            "replaced with U+FFFD in this view"
+        )
+    head_lines += notes
 
     ripped = "\n".join(head_lines + body)
 
@@ -311,12 +350,15 @@ async def rip_file_lines(file_path: str, start_line: int, end_line: int, ctx: Co
             if tail:
                 hb = avail // 2
                 tb = avail - hb
-                head_txt = "\n".join(head)[:hb]
-                tail_txt = "\n".join(tail)[-tb:]
+                # Take complete lines only: the tail is consumed in
+                # reverse so the LAST line survives, then re-reversed.
+                head_txt = "\n".join(_fit_or_mark(head, hb))
+                tail_txt = "\n".join(
+                    reversed(_fit_or_mark(list(reversed(tail)), tb)))
             else:
                 # Fewer head lines than the head budget: the whole
                 # avail goes to head instead of being half-wasted.
-                head_txt = "\n".join(head)[:avail]
+                head_txt = "\n".join(_fit_or_mark(head, avail))
                 tail_txt = ""
             ripped = "\n".join(p for p in (prefix, head_txt, marker, tail_txt, footer) if p)
         else:
@@ -718,6 +760,20 @@ async def apply_search_replace(file_path: str, search_block: str, replace_block:
 # C. Safety and version control
 # ═══════════════════════════════════════════════════════════
 
+def _path_matches(cand_path, target_path):
+    """True when a diagnostic's path plausibly refers to our target:
+    equal after normalization, or one is a suffix of the other at a
+    path boundary (so 'other/dir/main.py' does not match 'my/dir/main.py')."""
+    c = cand_path.replace("\\", "/").rstrip()
+    t = target_path.replace("\\", "/").rstrip()
+    if c == t:
+        return True
+    # One must be a suffix of the other, anchored at a path boundary
+    if t.endswith("/" + c) or c.endswith("/" + t):
+        return True
+    return False
+
+
 @register("lint_file")
 async def lint_file(file_path: str) -> str:
     """Python syntax check only (py_compile). Not a linter, type checker, or
@@ -747,14 +803,28 @@ async def lint_file(file_path: str) -> str:
     cmd = ["python3", "-m", "py_compile", path]
     basename = os.path.basename(path)
 
+    # Fingerprint the source before compiling so we can detect an edit
+    # racing between py_compile and the context read below.
+    try:
+        with open(path, "rb") as _sf:
+            sha_before = hashlib.sha256(_sf.read()).hexdigest()
+    except OSError:
+        sha_before = None
+
     try:
         res = subprocess.run(
             cmd,
             capture_output=True, text=True, shell=False,
             timeout=10,
         )
-    except subprocess.TimeoutExpired:
-        return f"FAIL: py_compile timed out after 10s — {basename}"
+    except subprocess.TimeoutExpired as exc:
+        partial = ""
+        err = getattr(exc, "stderr", None)
+        if err:
+            if isinstance(err, bytes):
+                err = err.decode("utf-8", errors="replace")
+            partial = "\n  partial stderr:\n  " + err.strip()[:800]
+        return f"FAIL: py_compile timed out after 10s — {basename}{partial}"
     except FileNotFoundError:
         return "FAIL: python3 not available on PATH"
     except PermissionError:
@@ -789,31 +859,30 @@ async def lint_file(file_path: str) -> str:
 
     # Pattern 1: file:line: message (requires .py path)
     # Pattern 2: py_compile "File ".../x.py", line N
-    # Pattern 3: fallback ", line N" (only when same file mentioned)
+    # Any diagnostic that names another file is NOT attributed to the
+    # target, and there is deliberately no generic ", line N" fallback:
+    # plain prose ("config error, line 1") is not a source location.
+    foreign_paths = []
     for line in stderr.splitlines():
         m = re.search(r'^(.+?\.py):(\d+):', line)
         if m:
-            cand_file = os.path.basename(m.group(1))
-            if cand_file.lower() == target_base.lower():
+            if _path_matches(m.group(1), path):
                 location_line = int(m.group(2))
                 break
+            foreign_paths.append(m.group(1))
             continue
         m = re.search(r'^File\s+"([^"]+\.py)",\s*line\s+(\d+)', line)
         if m:
-            cand_file = os.path.basename(m.group(1))
-            if cand_file.lower() == target_base.lower():
+            if _path_matches(m.group(1), path):
                 location_line = int(m.group(2))
                 break
+            foreign_paths.append(m.group(1))
             continue
-        m = re.search(r',\s*line\s+(\d+)', line)
-        if m:
-            if target_base.lower() in line.lower() or 'file' in line.lower():
-                location_line = int(m.group(1))
-                break
 
     # Build diagnostic output
     read_error = None
     lines = []
+    source_changed = False
     if location_line:
         # Read source file and extract context around error line
         try:
@@ -821,6 +890,15 @@ async def lint_file(file_path: str) -> str:
                 lines = f.readlines()
         except (OSError, UnicodeDecodeError) as e:
             read_error = str(e)
+
+        # Did the source move between compile and this read?
+        if sha_before is not None and lines:
+            try:
+                with open(path, "rb") as _sf:
+                    sha_after = hashlib.sha256(_sf.read()).hexdigest()
+                source_changed = sha_after != sha_before
+            except OSError:
+                source_changed = True
 
         # Validate the extracted line number against the real file
         if lines and not (1 <= location_line <= len(lines)):
@@ -836,6 +914,9 @@ async def lint_file(file_path: str) -> str:
         diagnostic = f"  {target_base}:{location_line}\n"
         if compile_msg:
             diagnostic += f"  {compile_msg}\n"
+        if source_changed:
+            diagnostic += ("  # note: source changed during compilation; "
+                           "excerpt may not match diagnostic\n")
         for i, src_line in enumerate(context_lines):
             actual_line = start + i + 1
             prefix = "→ " if actual_line == location_line else "  "
@@ -845,6 +926,11 @@ async def lint_file(file_path: str) -> str:
     else:
         # No location parsed - return raw stderr (capped)
         raw = stderr or "(no stderr)"
+        # A rejected foreign diagnostic must not look like an assertion
+        # about our file: drop its line number and label it as foreign.
+        for fp in sorted(set(foreign_paths), key=len, reverse=True):
+            raw = re.sub(re.escape(fp) + r':\d+:',
+                         fp + ' (other file):', raw)
         if len(raw) > 4000:
             suffix = "\n... [truncated] ...\n"
             budget = 4000 - len(suffix)
