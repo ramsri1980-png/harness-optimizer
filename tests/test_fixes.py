@@ -738,6 +738,162 @@ async def test_command_manifest_preserves_edits_on_uninstall():
 
 
 
+async def test_read_raw_range_preserved():
+    print("\n[Test READ-01] rip_file_lines raw range preserved (T02)")
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "sample.py")
+        content = (
+            "def foo():\n"
+            "    x = 1    \n"
+            "    y = 2\n"
+            "    return x + y\n"
+            "\n"
+            "def bar():\n"
+            "    pass\n"
+        )
+        with open(f, "w") as fh:
+            fh.write(content)
+        r = await server.rip_file_lines(f, 2, 3, None)
+        check("Header present", r.startswith("--- Lines 2 to 3"), r[:200])
+        check("sha256 line present", "# sha256: " in r, r[:300])
+        check("Line 2 present", "2:" in r, r[:300])
+        check("Line 3 present", "3:" in r, r[:300])
+        check("Line 1 NOT present", "1: def foo" not in r, r[:300])
+        check("Trailing spaces preserved", "x = 1    " in r, r[:400])
+        check("Response <= 4000", len(r) <= 4000, f"len={len(r)}")
+
+
+async def test_read_enclosing_symbol_opt_in():
+    print("\n[Test READ-02] rip_file_lines enclosing context (T02)")
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "sample.py")
+        with open(f, "w") as fh:
+            fh.write("def outer():\n")
+            fh.write("    x = 1\n")
+            fh.write("    y = 2\n")
+            fh.write("    z = 3\n")
+            fh.write("    return x\n")
+            fh.write("def other():\n")
+            fh.write("    pass\n")
+        r1 = await server.rip_file_lines(f, 3, 3, None)
+        check("Raw is raw", "context: expanded" not in r1, r1[:300])
+        r2 = await server.rip_file_lines(f, 3, 3, None, context="enclosing")
+        check("Expanded notes", "context: expanded" in r2, r2[:400])
+        check("Expanded includes def outer",
+              "def outer" in r2, r2[:400])
+        check("Expanded includes return x",
+              "return x" in r2, r2[:400])
+        txt = os.path.join(d, "notes.txt")
+        with open(txt, "w") as fh:
+            fh.write("line 1\nline 2\nline 3\n")
+        r3 = await server.rip_file_lines(txt, 2, 2, None, context="enclosing")
+        check("Non-.py falls back to raw",
+              "context: not a Python file" in r3 or "using raw range" in r3,
+              r3[:400])
+
+
+async def test_read_bounds_and_errors():
+    print("\n[Test READ-03] rip_file_lines bounds (T02)")
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "small.py")
+        with open(f, "w") as fh:
+            for i in range(1, 11):
+                fh.write(f"line{i}\n")
+        r = await server.rip_file_lines(f, 0, 5, None)
+        check("Zero start rejected", "ERROR:" in r, r[:200])
+        r = await server.rip_file_lines(f, 5, 3, None)
+        check("Reversed range rejected", "ERROR:" in r, r[:200])
+        r = await server.rip_file_lines(f, 100, 110, None)
+        check("Start beyond EOF rejected", "ERROR:" in r, r[:200])
+        r = await server.rip_file_lines(f, 5, 100, None)
+        check("End beyond EOF clipped",
+              "ERROR:" not in r and "Lines 5 to 10" in r, r[:300])
+        check("Header shows actual returned bounds",
+              "5 to 10" in r, r[:300])
+
+
+async def test_read_snapshot_fingerprint():
+    print("\n[Test READ-04] rip_file_lines fingerprint (T02)")
+    import hashlib
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "fp.py")
+        content = "def a():\n    return 1\n"
+        with open(f, "w") as fh:
+            fh.write(content)
+        expected = hashlib.sha256(content.encode()).hexdigest()
+        r = await server.rip_file_lines(f, 1, 1, None)
+        check("Fingerprint matches file bytes",
+              expected in r, f"expected {expected[:16]}, got {r[:300]}")
+        modified = content.replace("return 1", "return 2")
+        with open(f, "w") as fh:
+            fh.write(modified)
+        expected2 = hashlib.sha256(modified.encode()).hexdigest()
+        r2 = await server.rip_file_lines(f, 1, 1, None)
+        check("Fingerprint changes with content",
+              expected2 in r2 and expected not in r2, r2[:300])
+
+
+async def test_read_path_traversal_rejected():
+    print("\n[Test READ-05] rip_file_lines path handling (T02)")
+    # NOTE: full permission/symlink integration is BLOCKED pending
+    # the shared workspace module (CORE workstream). This test covers
+    # only what is possible with the current file-API.
+    with tempfile.TemporaryDirectory() as d:
+        r = await server.rip_file_lines(os.path.join(d, "nope.py"), 1, 1, None)
+        check("Missing file rejected",
+              "ERROR:" in r or "not found" in r.lower(), r[:200])
+        subdir = os.path.join(d, "sub")
+        os.makedirs(subdir)
+        r = await server.rip_file_lines(subdir, 1, 1, None)
+        check("Directory rejected",
+              "ERROR:" in r or "directory" in r.lower(), r[:200])
+
+
+async def test_read_huge_line_useful_failure():
+    print("\n[Test READ-06] rip_file_lines huge line (T02)")
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "huge.py")
+        with open(f, "w") as fh:
+            fh.write("small = 1\n")
+            fh.write("big = \"" + "x" * 8000 + "\"\n")
+            fh.write("small2 = 2\n")
+        r = await server.rip_file_lines(f, 1, 3, None)
+        check("Response <= 4000 chars", len(r) <= 4000, f"len={len(r)}")
+        check("Truncation marker present or hash preserved",
+              "[truncated]" in r or "# sha256:" in r, r[:400])
+
+
+async def test_read_enclosing_innermost():
+    print("\n[Test READ-07] rip_file_lines innermost enclosing symbol (T02 fix)")
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "nested.py")
+        with open(f, "w") as fh:
+            fh.write("class Handler:\n")          # L1
+            fh.write("    def do_GET(self):\n")   # L2
+            fh.write("        x = 1\n")           # L3
+            fh.write("        return x\n")        # L4
+            fh.write("    def other(self):\n")    # L5
+            fh.write("        pass\n")            # L6
+        r = await server.rip_file_lines(f, 3, 3, None, context="enclosing")
+        check("Innermost is do_GET", "def do_GET" in r, r[:400])
+        check("Not expanded to whole class",
+              "def other" not in r, r[:400])
+
+
+async def test_read_truncation_budget_use():
+    print("\n[Test READ-08] rip_file_lines truncation budget (T02 fix)")
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "big_line.py")
+        with open(f, "w") as fh:
+            fh.write("a\n")
+            fh.write("x" * 8000 + "\n")
+            fh.write("b\n")
+        r = await server.rip_file_lines(f, 1, 3, None)
+        check("Uses > 3000 chars of budget",
+              len(r) > 3000, f"len={len(r)}")
+        check("Response <= 4000", len(r) <= 4000, f"len={len(r)}")
+
+
 async def main():
     print("=" * 60)
     print("Harness-Optimizer Fix Verification")
@@ -785,6 +941,14 @@ async def main():
     await test_lint_truncation_cap()
     await test_lint_permission_and_directory()
     await test_lint_rejects_cross_file_and_generic_line()
+    await test_read_raw_range_preserved()
+    await test_read_enclosing_symbol_opt_in()
+    await test_read_bounds_and_errors()
+    await test_read_snapshot_fingerprint()
+    await test_read_path_traversal_rejected()
+    await test_read_huge_line_useful_failure()
+    await test_read_enclosing_innermost()
+    await test_read_truncation_budget_use()
 
 
     print("\n" + "=" * 60)

@@ -8,6 +8,7 @@ Environment:
                  client, so the model never sees them.
 """
 import ast
+import hashlib
 import os
 import re
 import shlex
@@ -151,33 +152,187 @@ async def get_repo_skeleton(repo_path: str = ".", max_files: int = 500):
 
     return skeleton_text + "\n\n" + metric
 
+# T02 tuning constants for rip_file_lines
+_RIP_MAX_CHARS = 4000          # hard response cap
+_RIP_MAX_EXPAND = 500          # enclosing-symbol expansion cap
+_RIP_HEAD_LINES = 20           # source lines kept at head when truncating
+_RIP_TAIL_LINES = 20           # source lines kept at tail when truncating
+_RIP_METRIC_RESERVE = 160      # conservative room for [TOKEN METRIC] line
+
+
+def _enclosing_definition(lines, start_line):
+    """Innermost class/function containing start_line, as (kind, name,
+    def_start, def_end). def_start includes decorator lines. None if the
+    file is unparsable or nothing encloses the line."""
+    src = "\n".join(lines)
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return None
+
+    best = None
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        def_end = getattr(node, "end_lineno", None)
+        if def_end is None:
+            continue
+        decs = getattr(node, "decorator_list", None) or []
+        def_start = min([node.lineno] + [d.lineno for d in decs])
+        if def_start <= start_line <= def_end:
+            # best = (kind, name, def_start, def_end); compare def_start
+            # so the deepest nested symbol containing the line wins.
+            if best is None or def_start > best[2]:
+                kind = "class" if isinstance(node, ast.ClassDef) else "def"
+                best = (kind, node.name, def_start, def_end)
+    return best
+
+
 @register("rip_file_lines")
-async def rip_file_lines(file_path: str, start_line: int, end_line: int, ctx: Context) -> str:
+async def rip_file_lines(file_path: str, start_line: int, end_line: int, ctx: Context,
+                         context: str = "raw") -> str:
     """View a precise line window from a file. Use this instead of reading
-    full files. Line numbers are 1-indexed and printed for reference."""
+    full files. Line numbers are 1-indexed and printed for reference.
+
+    Response format:
+        --- Lines A to B of T ---
+        # sha256: <hex of raw file bytes>
+        A: <source line>
+        ...
+
+    The sha256 line fingerprints the exact bytes the excerpt was built
+    from, so a later rip can be checked for staleness.
+
+    context="raw" (default) returns exactly the requested range.
+    context="enclosing" expands the range to the whole enclosing
+    class/function (up to 500 lines) when the request falls inside one.
+
+    Bounds: start_line < 1 or end_line < start_line is an ERROR; a
+    start beyond EOF is an ERROR; an end beyond EOF is silently clipped
+    and the header reports the actual returned bounds. An empty file
+    yields the header "Lines 1 to 0 of 0" plus the sha256 of the empty
+    string (e3b0c442...b855).
+
+    Whitespace: only the line terminator is removed when splitting
+    (\r\n or \n); trailing spaces/tabs are preserved in the output and
+    CRLF input is emitted as LF.
+
+    Output is capped at 4000 characters; oversized excerpts keep the
+    first and last 20 source lines with a truncation marker."""
     file_path = os.path.expanduser(file_path)
     if not os.path.exists(file_path):
         return f"Error: File {file_path} not found."
+    if os.path.isdir(file_path):
+        return f"ERROR: {file_path} is a directory, not a file"
+    if start_line < 1 or end_line < start_line:
+        return "ERROR: invalid range — start_line must be >= 1 and end_line >= start_line"
+
+    basename = os.path.basename(file_path)
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            all_content = f.read()
-        lines = all_content.splitlines()
+        with open(file_path, "rb") as f:
+            raw_bytes = f.read()
+    except OSError as exc:
+        return f"Failed to rip file ranges: {exc}"
 
-        s_idx = max(0, start_line - 1)
-        e_idx = min(len(lines), end_line)
+    fingerprint = hashlib.sha256(raw_bytes).hexdigest()
+    text = raw_bytes.decode("utf-8", errors="replace")
+    # Split on \n and drop a single trailing \r per line; a trailing
+    # newline does not create an extra phantom line.
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    lines = [ln[:-1] if ln.endswith("\r") else ln for ln in lines]
+    total = len(lines)
 
-        out = [f"--- Lines {start_line} to {end_line} of {len(lines)} ---"]
-        for idx, line in enumerate(lines[s_idx:e_idx], start=start_line):
-            out.append(f"{idx}: {line.rstrip()}")
+    if total == 0:
+        # Empty file: emit the sha256 of the empty string and a
+        # "Lines 1 to 0 of 0" header (documented convention).
+        out = [f"--- Lines 1 to 0 of 0 ---", f"# sha256: {fingerprint}"]
         ripped = "\n".join(out)
+        if ctx is not None:
+            baseline = estimate_tokens(text)
+            actual = estimate_tokens(ripped)
+            saved = max(0, baseline - actual)
+            ripped += "\n\n" + await emit_metric(ctx, "rip_file_lines", saved, baseline, actual)
+        return ripped
 
-        baseline = estimate_tokens(all_content)
+    if start_line > total:
+        return f"ERROR: start_line {start_line} exceeds file length {total} — {basename}"
+
+    # Clip the end to the real file length; the header reports the
+    # bounds actually returned.
+    end_line = min(end_line, total)
+    req_start, req_end = start_line, end_line
+
+    notes = []
+    if context == "enclosing":
+        if not file_path.lower().endswith(".py"):
+            notes.append("# context: not a Python file, or parse failed; using raw range")
+        else:
+            enc = _enclosing_definition(lines, start_line)
+            if enc is None:
+                notes.append("# context: not a Python file, or parse failed; using raw range")
+            else:
+                kind, name, def_start, def_end = enc
+                span = def_end - def_start + 1
+                if span > _RIP_MAX_EXPAND:
+                    notes.append(f"# context: enclosing {kind} {name} is {span} lines; exceeds {_RIP_MAX_EXPAND}-line cap")
+                    notes.append("# context: falling back to raw range")
+                else:
+                    new_start = min(start_line, def_start)
+                    new_end = max(end_line, def_end)
+                    if (new_start, new_end) != (req_start, req_end):
+                        # req_end is already the clipped value, so the
+                        # note describes the range actually read, not
+                        # the user's unfulfilled request beyond EOF.
+                        notes.append(
+                            f"# context: expanded from lines {req_start}-{req_end} "
+                            f"to lines {new_start}-{new_end} (enclosing {kind} {name})"
+                        )
+                        start_line, end_line = new_start, new_end
+
+    header = f"--- Lines {start_line} to {end_line} of {total} ---"
+    body = [f"{idx}: {lines[idx - 1]}" for idx in range(start_line, end_line + 1)]
+    head_lines = [header, f"# sha256: {fingerprint}"] + notes
+
+    ripped = "\n".join(head_lines + body)
+
+    if len(ripped) > _RIP_MAX_CHARS:
+        head = body[:_RIP_HEAD_LINES]
+        tail = body[-_RIP_TAIL_LINES:] if len(body) > _RIP_HEAD_LINES else []
+        marker = "    ... [truncated] ..."
+        footer = "    (truncated; request a narrower range for full content)"
+        prefix = "\n".join(head_lines)
+        avail = (_RIP_MAX_CHARS - len(prefix) - len(marker)
+                 - len(footer) - 4 - _RIP_METRIC_RESERVE)
+        if avail > 0:
+            if tail:
+                hb = avail // 2
+                tb = avail - hb
+                head_txt = "\n".join(head)[:hb]
+                tail_txt = "\n".join(tail)[-tb:]
+            else:
+                # Fewer head lines than the head budget: the whole
+                # avail goes to head instead of being half-wasted.
+                head_txt = "\n".join(head)[:avail]
+                tail_txt = ""
+            ripped = "\n".join(p for p in (prefix, head_txt, marker, tail_txt, footer) if p)
+        else:
+            ripped = "\n".join([prefix, marker, footer])
+
+    if ctx is not None:
+        baseline = estimate_tokens(text)
         actual = estimate_tokens(ripped)
         saved = max(0, baseline - actual)
         metric = await emit_metric(ctx, "rip_file_lines", saved, baseline, actual)
-        return ripped + "\n\n" + metric
-    except Exception as exc:
-        return f"Failed to rip file ranges: {exc}"
+        if metric:
+            ripped = ripped + "\n\n" + metric
+
+    if len(ripped) > _RIP_MAX_CHARS:
+        footer = "    (truncated; request a narrower range for full content)"
+        ripped = ripped[:_RIP_MAX_CHARS - len(footer) - 1] + "\n" + footer
+
+    return ripped
 
 @register("find_dependent_references")
 async def find_dependent_references(
