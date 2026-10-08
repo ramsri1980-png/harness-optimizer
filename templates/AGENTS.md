@@ -31,18 +31,12 @@ Use the smallest sufficient context — not the smallest possible excerpt.
   evidence that code works.
 
 ## Token Metric Reporting
-When a harness-tools call returns text containing a `[TOKEN METRIC]` line,
-include that line verbatim in your reply when it is easy to do so:
+Routine `[TOKEN METRIC]` lines are recorded by the token-metrics plugin in
+`~/.config/opencode/.harness-token-metrics.log`. Do not echo them in normal
+assistant replies — keep them out of the conversation flow. Display a metric
+only when the user explicitly asks for it, and describe it as an estimated
+payload reduction (not measured end-to-end savings). Never fabricate numbers.
 
-    💰 <tool_name>: saved <N> tokens (<baseline> baseline → <actual> actual)
-
-The `<N>` value is an **estimated payload reduction** — the difference between
-the full-file representation and the returned excerpt, computed as
-`len(text)//4`. It is **not** a measured end-to-end token saving.
-
-Do not summarize, inflate, or fabricate the numbers. The token-metrics plugin
-also records every metric to `~/.config/opencode/.harness-token-metrics.log`,
-so skipping the line in chat is acceptable — never invent a replacement.
 
 ## Context Pressure Protocol
 When context-watch warns you, STOP and produce a Context Checkpoint Report:
@@ -58,8 +52,10 @@ Do NOT continue after the report unless the user says so.
 
 ## Model Fallback
 If fallback switches models mid-task, you still have full history.
-Do not re-read files or re-run tests. Continue where the previous model left off.
-
+Reuse prior evidence when it remains available and applicable. Reread files
+or rerun checks when relevant state changed, evidence is missing, or
+correctness is uncertain. Do not blindly redo everything, and do not blindly
+trust stale evidence either.
 
 ## No Shell Bypass of Refused Edits
 If a harness-tools edit is refused (ambiguous search, empty search, missing

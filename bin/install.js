@@ -141,14 +141,13 @@ if (FLAGS.uninstall) {
     if (fs.existsSync(f)) { fs.rmSync(f); info(`Removed ${f}`); }
   }
 
-  // AGENTS.md uninstall — marker-aware
-  //   1. Backup exists (force-installed over user's file):
-  //        - markers + user content outside → strip section, preserve their edits + backup
-  //        - markers only                    → restore their original from backup
-  //        - no markers                      → restore their original from backup
-  //   2. Markers present → strip section, keep anything outside
-  //   3. Legacy marker, no file markers → hash check
-  //   4. Otherwise → leave file alone
+  // AGENTS.md uninstall — marker-aware + backup-safe
+  //   1. Valid markers in current file → strip section, preserve outside
+  //      (if nothing left outside AND a backup exists → restore backup)
+  //   2. Backup exists, current file has no valid markers → AMBIGUOUS:
+  //      leave both files, warn (do NOT overwrite newer personal content)
+  //   3. Legacy ownership marker, no backup → hash check
+  //   4. Otherwise → leave alone
   const agentsDst = path.join(CONFIG_DIR, "AGENTS.md");
   const agentsBackup = path.join(CONFIG_DIR, "AGENTS.md.harness-backup");
   const agentsMarker = path.join(CONFIG_DIR, ".harness-owns-agents");
@@ -157,46 +156,47 @@ if (FLAGS.uninstall) {
 
   const hasFile = fs.existsSync(agentsDst);
   const hasBackup = fs.existsSync(agentsBackup);
+  const hasMarkerFile = fs.existsSync(agentsMarker);
   const content = hasFile ? fs.readFileSync(agentsDst, "utf8") : "";
-  const hasMarkers = hasFile
-    && content.includes(AGENTS_START_U)
-    && content.includes(AGENTS_END_U);
 
-  function stripMarkedSection(text) {
-    const s = text.indexOf(AGENTS_START_U);
-    const e = text.indexOf(AGENTS_END_U) + AGENTS_END_U.length;
-    const before = text.slice(0, s).trim();
-    const after = text.slice(e).trim();
-    return [before, after].filter(Boolean).join("\n\n");
+  function validateMarkersU(text) {
+    const starts = [];
+    const ends = [];
+    let i = 0;
+    while ((i = text.indexOf(AGENTS_START_U, i)) !== -1) { starts.push(i); i += AGENTS_START_U.length; }
+    i = 0;
+    while ((i = text.indexOf(AGENTS_END_U, i)) !== -1) { ends.push(i); i += AGENTS_END_U.length; }
+    if (starts.length !== 1 || ends.length !== 1) return { valid: false };
+    if (ends[0] < starts[0]) return { valid: false };
+    return { valid: true, sIdx: starts[0], eIdx: ends[0] + AGENTS_END_U.length };
   }
 
-  if (hasBackup) {
-    if (hasMarkers) {
-      const remainder = stripMarkedSection(content);
-      if (remainder) {
-        fs.writeFileSync(agentsDst, remainder + "\n");
-        info("Removed harness section from AGENTS.md (your content preserved).");
-        info(`Your pre-install backup remains at: ${agentsBackup}`);
-      } else {
-        fs.copyFileSync(agentsBackup, agentsDst);
-        fs.rmSync(agentsBackup);
-        info("Restored your original AGENTS.md from backup.");
-      }
-    } else {
-      fs.copyFileSync(agentsBackup, agentsDst);
-      fs.rmSync(agentsBackup);
-      info("Restored your original AGENTS.md from backup.");
-    }
-  } else if (hasMarkers) {
-    const remainder = stripMarkedSection(content);
+  const mv = hasFile ? validateMarkersU(content) : { valid: false };
+
+  if (hasFile && mv.valid) {
+    const before = content.slice(0, mv.sIdx).trim();
+    const after = content.slice(mv.eIdx).trim();
+    const remainder = [before, after].filter(Boolean).join("\n\n");
     if (remainder) {
       fs.writeFileSync(agentsDst, remainder + "\n");
       info("Removed harness section from AGENTS.md (your content preserved).");
+    } else if (hasBackup) {
+      fs.copyFileSync(agentsBackup, agentsDst);
+      fs.rmSync(agentsBackup);
+      info("Restored your original AGENTS.md from backup.");
     } else {
       fs.rmSync(agentsDst);
       info("Removed harness-created AGENTS.md.");
     }
-  } else if (hasFile && fs.existsSync(agentsMarker)) {
+  } else if (hasFile && hasBackup) {
+    // Current file has no valid markers, but a backup exists. We cannot tell
+    // whether the current file is user-edited harness content or newer
+    // personal content. Refuse to overwrite either — leave both files.
+    warn("AGENTS.md has no valid harness markers but a pre-install backup exists.");
+    warn(`  Current:  ${agentsDst}`);
+    warn(`  Backup:   ${agentsBackup}`);
+    warn("  Leaving both files in place — decide which to keep, then delete the other.");
+  } else if (hasFile && hasMarkerFile) {
     const storedHash = readMarkerHash(agentsMarker);
     const currentHash = sha256(content);
     if (storedHash === null || storedHash === currentHash) {
@@ -209,7 +209,7 @@ if (FLAGS.uninstall) {
     info("AGENTS.md not owned by harness — left in place.");
   }
 
-  if (fs.existsSync(agentsMarker)) fs.rmSync(agentsMarker);
+  if (hasMarkerFile) fs.rmSync(agentsMarker);
   console.log("");
   info("Uninstall complete.");
   process.exit(0);
@@ -534,23 +534,36 @@ function writeAgentsMarker() {
   }, null, 2) + "\n");
 }
 
+// Validate markers in a text: exactly one START, one END, in order.
+function validateAgentsMarkers(text) {
+  const starts = [];
+  const ends = [];
+  let i = 0;
+  while ((i = text.indexOf(AGENTS_START, i)) !== -1) { starts.push(i); i += AGENTS_START.length; }
+  i = 0;
+  while ((i = text.indexOf(AGENTS_END, i)) !== -1) { ends.push(i); i += AGENTS_END.length; }
+  if (starts.length === 0 && ends.length === 0) return { valid: false, reason: "no markers" };
+  if (starts.length !== 1) return { valid: false, reason: `expected 1 START marker, found ${starts.length}` };
+  if (ends.length !== 1) return { valid: false, reason: `expected 1 END marker, found ${ends.length}` };
+  if (ends[0] < starts[0]) return { valid: false, reason: "END marker before START marker" };
+  return { valid: true, sIdx: starts[0], eIdx: ends[0] + AGENTS_END.length };
+}
+
+// Template must be valid
+const tplV = validateAgentsMarkers(agentsTemplate);
+if (!tplV.valid) fail(`templates/AGENTS.md is malformed: ${tplV.reason}`);
+
 if (!fs.existsSync(agentsDst)) {
   fs.copyFileSync(agentsSrc, agentsDst);
   writeAgentsMarker();
   info("Installed global AGENTS.md (harness-owned, managed section).");
 } else {
   const existing = fs.readFileSync(agentsDst, "utf8");
-  const hasMarkers = existing.includes(AGENTS_START) && existing.includes(AGENTS_END);
+  const ev = validateAgentsMarkers(existing);
 
-  if (hasMarkers) {
-    const tStart = agentsTemplate.indexOf(AGENTS_START);
-    const tEnd = agentsTemplate.indexOf(AGENTS_END) + AGENTS_END.length;
-    const newSection = agentsTemplate.slice(tStart, tEnd);
-
-    const eStart = existing.indexOf(AGENTS_START);
-    const eEnd = existing.indexOf(AGENTS_END) + AGENTS_END.length;
-    const merged = existing.slice(0, eStart) + newSection + existing.slice(eEnd);
-
+  if (ev.valid) {
+    const newSection = agentsTemplate.slice(tplV.sIdx, tplV.eIdx);
+    const merged = existing.slice(0, ev.sIdx) + newSection + existing.slice(ev.eIdx);
     if (merged === existing) {
       info("AGENTS.md managed section already up to date.");
     } else {
@@ -558,6 +571,8 @@ if (!fs.existsSync(agentsDst)) {
       info("Updated harness section in AGENTS.md (user content outside markers preserved).");
     }
     writeAgentsMarker();
+  } else if (existing.includes(AGENTS_START) || existing.includes(AGENTS_END)) {
+    warn(`AGENTS.md has malformed harness markers (${ev.reason}) — file left unchanged. Fix or remove the markers, or use --force to overwrite.`);
   } else if (FLAGS.force) {
     if (!fs.existsSync(agentsBackup)) {
       fs.copyFileSync(agentsDst, agentsBackup);

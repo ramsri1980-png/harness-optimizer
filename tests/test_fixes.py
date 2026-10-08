@@ -362,6 +362,111 @@ async def test_agents_md_uninstall_strips_only_marked():
             check("User content preserved",
                   "My personal addition" in text and "Keep this." in text)
 
+async def test_malformed_markers_rejected():
+    print("\n[Test 20] Malformed markers reject update (0.2.9)")
+    with tempfile.TemporaryDirectory() as fake_home:
+        home = pathlib.Path(fake_home)
+        run_installer(home, "--no-runtime")
+        md = home / ".config" / "opencode" / "AGENTS.md"
+
+        # Corrupt: duplicate START marker
+        text = md.read_text()
+        corrupted = text + "\n<!-- HARNESS-OPTIMIZER:START -->\ndangling\n"
+        md.write_text(corrupted)
+        before = md.read_text()
+
+        rc, out = run_installer(home, "--no-runtime")
+        after = md.read_text()
+
+        check("File left unchanged on duplicate markers",
+              before == after, "file was modified")
+        check("Warns about malformed markers",
+              "malformed" in out.lower() or "found 2" in out.lower(), out[:400])
+
+
+async def test_reversed_markers_rejected():
+    print("\n[Test 21] Reversed markers reject update (0.2.9)")
+    with tempfile.TemporaryDirectory() as fake_home:
+        home = pathlib.Path(fake_home)
+        run_installer(home, "--no-runtime")
+        md = home / ".config" / "opencode" / "AGENTS.md"
+
+        # Corrupt: swap markers so END comes first
+        bad = (
+            "<!-- HARNESS-OPTIMIZER:END -->\n"
+            "# some content\n"
+            "<!-- HARNESS-OPTIMIZER:START -->\n"
+        )
+        md.write_text(bad)
+        before = md.read_text()
+
+        rc, out = run_installer(home, "--no-runtime")
+        after = md.read_text()
+
+        check("File left unchanged on reversed markers",
+              before == after, "file was modified")
+        check("Warns about reversed or malformed",
+              "malformed" in out.lower() or "before START" in out.lower(),
+              out[:400])
+
+
+async def test_backup_and_unmarked_file_leaves_both():
+    print("\n[Test 22] Backup + unmarked file → both preserved (0.2.9)")
+    with tempfile.TemporaryDirectory() as fake_home:
+        home = pathlib.Path(fake_home)
+        cfgdir = home / ".config" / "opencode"
+        cfgdir.mkdir(parents=True)
+
+        # Simulate: user had a personal file, harness force-installed, then user
+        # replaced AGENTS.md with newer personal content (no markers)
+        (cfgdir / "AGENTS.md.harness-backup").write_text(
+            "# Pre-install backup\nOld content.\n"
+        )
+        (cfgdir / "AGENTS.md").write_text(
+            "# Newer personal file\nShould not be overwritten.\n"
+        )
+
+        rc, out = run_installer(home, "--uninstall")
+
+        check("Current file preserved",
+              (cfgdir / "AGENTS.md").exists() and
+              "Newer personal" in (cfgdir / "AGENTS.md").read_text(),
+              (cfgdir / "AGENTS.md").read_text()[:200] if (cfgdir / "AGENTS.md").exists() else "gone")
+        check("Backup preserved (not restored over current)",
+              (cfgdir / "AGENTS.md.harness-backup").exists(),
+              "backup was consumed")
+        check("Warns user to decide",
+              "leaving both" in out.lower() or "no valid" in out.lower(),
+              out[:400])
+
+
+async def test_managed_section_update_still_works():
+    print("\n[Test 23] Managed section update still works (0.2.9 regression)")
+    with tempfile.TemporaryDirectory() as fake_home:
+        home = pathlib.Path(fake_home)
+        run_installer(home, "--no-runtime")
+        md = home / ".config" / "opencode" / "AGENTS.md"
+
+        # Add user content outside markers
+        with open(md, "a") as f:
+            f.write("\n# Personal section\nKeep this forever.\n")
+
+        # Corrupt the managed section, then reinstall should restore it
+        text = md.read_text()
+        modified = text.replace(
+            "# Global Rules (all OpenCode sessions)",
+            "# Global Rules (all OpenCode sessions) - CORRUPTED"
+        )
+        md.write_text(modified)
+
+        run_installer(home, "--no-runtime")
+
+        after = md.read_text()
+        check("Managed section restored",
+              "CORRUPTED" not in after)
+        check("User content outside markers preserved",
+              "Personal section" in after and "Keep this forever." in after)
+
 
 async def main():
     print("=" * 60)
@@ -386,6 +491,11 @@ async def main():
     await test_agents_md_markers_present()
     await test_agents_md_managed_section_updates()
     await test_agents_md_uninstall_strips_only_marked()
+    await test_malformed_markers_rejected()
+    await test_reversed_markers_rejected()
+    await test_backup_and_unmarked_file_leaves_both()
+    await test_managed_section_update_still_works()
+
 
     print("\n" + "=" * 60)
     passed = sum(1 for _, ok in results if ok)
