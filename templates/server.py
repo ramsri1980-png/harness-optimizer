@@ -422,8 +422,12 @@ async def lint_file(file_path: str) -> str:
     if not os.path.exists(path):
         return f"FAIL: file not found — {path}"
 
+    if not os.path.isfile(path):
+        return f"FAIL: not a file — {path}"
+
     cwd = os.path.dirname(os.path.abspath(path))
     cmd = ["python3", "-m", "py_compile", path]
+    basename = os.path.basename(path)
 
     try:
         res = subprocess.run(
@@ -432,9 +436,13 @@ async def lint_file(file_path: str) -> str:
             timeout=10,
         )
     except subprocess.TimeoutExpired:
-        return f"FAIL: py_compile timed out after 10s — {os.path.basename(path)}"
+        return f"FAIL: py_compile timed out after 10s — {basename}"
     except FileNotFoundError:
         return "FAIL: python3 not available on PATH"
+    except PermissionError:
+        return f"FAIL: py_compile not permitted — {basename}"
+    except OSError as e:
+        return f"FAIL: py_compile launch failed — {basename}: {e}"
 
     # Build execution header only for non-OK results
     if res.returncode == 0:
@@ -447,50 +455,75 @@ async def lint_file(file_path: str) -> str:
         f"  exit: {res.returncode}\n"
     )
 
-    # Parse stderr for location info
+    # Parse stderr for location info and compiler message
     stderr = (res.stderr or "").strip()
+    target_base = os.path.basename(path)
     location_line = None
+
+    # Preserve the compiler's own error type + message (e.g.
+    # "SyntaxError: invalid syntax") for the FAIL section.
+    compile_msg = None
+    for line in stderr.splitlines():
+        s = line.strip()
+        if re.match(r'^[A-Za-z_][A-Za-z0-9_]*(?:Error|Exception|Warning)\b', s):
+            compile_msg = s
+            break
 
     # Pattern 1: file:line: message (requires .py path)
     # Pattern 2: py_compile "File ".../x.py", line N
-    # Pattern 3: fallback ", line N"
+    # Pattern 3: fallback ", line N" (only when same file mentioned)
     for line in stderr.splitlines():
         m = re.search(r'^(.+?\.py):(\d+):', line)
-        if not m:
-            m = re.search(r'^File\s+"([^"]+\.py)",\s*line\s+(\d+)', line)
-        if not m:
-            m = re.search(r',\s*line\s+(\d+)', line)
         if m:
-            location_line = int(m.groups()[-1])
-            break
+            cand_file = os.path.basename(m.group(1))
+            if cand_file.lower() == target_base.lower():
+                location_line = int(m.group(2))
+                break
+            continue
+        m = re.search(r'^File\s+"([^"]+\.py)",\s*line\s+(\d+)', line)
+        if m:
+            cand_file = os.path.basename(m.group(1))
+            if cand_file.lower() == target_base.lower():
+                location_line = int(m.group(2))
+                break
+            continue
+        m = re.search(r',\s*line\s+(\d+)', line)
+        if m:
+            if target_base.lower() in line.lower() or 'file' in line.lower():
+                location_line = int(m.group(1))
+                break
 
     # Build diagnostic output
+    read_error = None
+    lines = []
     if location_line:
         # Read source file and extract context around error line
         try:
             with open(path, 'r') as f:
                 lines = f.readlines()
         except (OSError, UnicodeDecodeError) as e:
-            lines = []
             read_error = str(e)
 
-        if lines:
-            # Get up to 5 lines total centered on error line (1-indexed)
-            err_idx = location_line - 1
-            start = max(0, err_idx - 2)
-            end = min(len(lines), err_idx + 3)
-            context_lines = lines[start:end]
+        # Validate the extracted line number against the real file
+        if lines and not (1 <= location_line <= len(lines)):
+            location_line = None
 
-            diagnostic = f"  {os.path.basename(path)}:{location_line}\n"
-            for i, src_line in enumerate(context_lines):
-                actual_line = start + i + 1
-                prefix = "→ " if actual_line == location_line else "  "
-                diagnostic += f"    {prefix}{actual_line}: {src_line.rstrip()}\n"
-        else:
-            if 'read_error' in locals():
-                diagnostic = f"  {os.path.basename(path)}:{location_line}\n    (source unavailable: {read_error})\n"
-            else:
-                diagnostic = f"  {os.path.basename(path)}:{location_line}\n    (source unavailable)\n"
+    if location_line and lines:
+        # Get up to 5 lines total centered on error line (1-indexed)
+        err_idx = location_line - 1
+        start = max(0, err_idx - 2)
+        end = min(len(lines), err_idx + 3)
+        context_lines = lines[start:end]
+
+        diagnostic = f"  {target_base}:{location_line}\n"
+        if compile_msg:
+            diagnostic += f"  {compile_msg}\n"
+        for i, src_line in enumerate(context_lines):
+            actual_line = start + i + 1
+            prefix = "→ " if actual_line == location_line else "  "
+            diagnostic += f"    {prefix}{actual_line}: {src_line.rstrip()}\n"
+    elif location_line and read_error:
+        diagnostic = f"  {target_base}:{location_line}\n    (source unavailable: {read_error})\n"
     else:
         # No location parsed - return raw stderr (capped)
         raw = stderr or "(no stderr)"
@@ -500,8 +533,20 @@ async def lint_file(file_path: str) -> str:
             half = budget // 2
             raw = raw[:half] + suffix + raw[-half:]
         diagnostic = f"  {raw}\n  (no location parsed)\n"
+        # Unknown nonzero returncode with no parseable location: do not
+        # assert a source defect we cannot confirm.
+        result = f"{header}FAIL: Python syntax check failed — {target_base}\n{diagnostic}"
 
-    result = f"{header}FAIL: Python syntax error — {os.path.basename(path)}\n{diagnostic}"
+        # Cap total output at 4000 chars
+        if len(result) > 4000:
+            suffix = "\n... [truncated] ...\n"
+            budget = 4000 - len(suffix)
+            half = budget // 2
+            result = result[:half] + suffix + result[-half:]
+
+        return result
+
+    result = f"{header}FAIL: Python syntax error — {target_base}\n{diagnostic}"
 
     # Cap total output at 4000 chars
     if len(result) > 4000:

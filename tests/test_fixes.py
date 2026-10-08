@@ -777,11 +777,14 @@ async def main():
     await test_legacy_commands_preserved_with_warning()
     await test_command_manifest_blocks_overwrite_of_user_file()
     await test_command_manifest_preserves_edits_on_uninstall()
+    await test_lint_python_statuses()
     await test_lint_diagnostic_context()
     await test_lint_timeout_and_interpreter_error()
     await test_lint_unrecognized_diagnostic()
     await test_lint_line_5_context()
     await test_lint_truncation_cap()
+    await test_lint_permission_and_directory()
+    await test_lint_rejects_cross_file_and_generic_line()
 
 
     print("\n" + "=" * 60)
@@ -795,6 +798,38 @@ async def main():
             if not ok:
                 print(f"  ✗ {name}")
         sys.exit(1)
+
+
+async def test_lint_python_statuses():
+    print("\n[Test LINT-01] lint_file Python statuses (T05)")
+    with tempfile.TemporaryDirectory() as d:
+        valid = os.path.join(d, "valid.py")
+        with open(valid, "w") as f:
+            f.write("def a():\n    return 1\n")
+        invalid = os.path.join(d, "invalid.py")
+        with open(invalid, "w") as f:
+            f.write("def a(:\n    return 1\n")
+        notes = os.path.join(d, "notes.txt")
+        with open(notes, "w") as f:
+            f.write("hello\n")
+
+        r1 = await server.lint_file(valid)
+        r2 = await server.lint_file(invalid)
+        r3 = await server.lint_file(notes)
+        r4 = await server.lint_file(os.path.join(d, "missing.py"))
+
+        check("Valid .py returns OK", r1.startswith("OK:"), r1[:200])
+        check("Invalid .py returns FAIL",
+              r2.startswith("FAIL:") or "FAIL:" in r2, r2[:200])
+        check("Invalid .py mentions syntax error",
+              "syntax error" in r2.lower() or "invalid syntax" in r2.lower(),
+              r2[:200])
+        check("Non-.py returns SKIPPED", r3.startswith("SKIPPED:"), r3[:200])
+        check("Missing .py returns FAIL not found",
+              "FAIL:" in r4 and "not found" in r4, r4[:200])
+        check("Compiler message preserved",
+              "SyntaxError" in r2 or "invalid syntax" in r2.lower(),
+              r2[:400])
 
 
 async def test_lint_diagnostic_context():
@@ -894,6 +929,61 @@ async def test_lint_truncation_cap():
             r = await server.lint_file(bad)
         check("Truncated output contains marker", "\n... [truncated] ...\n" in r, r[:500])
         check("Total length ≤ 4000", len(r) <= 4000, f"len={len(r)}")
+
+
+async def test_lint_permission_and_directory():
+    print("\n[Test LINT-09] lint_file permission + non-file (T05 hotfix)")
+    with tempfile.TemporaryDirectory() as d:
+        weird_dir = os.path.join(d, "fake.py")
+        os.makedirs(weird_dir)
+        r = await server.lint_file(weird_dir)
+        check("Directory named .py is rejected",
+              "not a file" in r.lower() or "FAIL:" in r, r[:300])
+        check("No syntax error claimed for directory",
+              "syntax error" not in r.lower(), r[:300])
+
+        from unittest.mock import patch
+        real = os.path.join(d, "real.py")
+        with open(real, "w") as f:
+            f.write("pass\n")
+        with patch("server.subprocess.run",
+                   side_effect=PermissionError("denied")):
+            r = await server.lint_file(real)
+        check("PermissionError returns FAIL", "FAIL:" in r, r[:200])
+        check("PermissionError mentions permission or not permitted",
+              "permission" in r.lower() or "not permitted" in r.lower(),
+              r[:200])
+
+
+async def test_lint_rejects_cross_file_and_generic_line():
+    print("\n[Test LINT-10] lint_file cross-file + generic line (T05 hotfix)")
+    from unittest.mock import patch
+    from subprocess import CompletedProcess
+
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "valid.py")
+        with open(f, "w") as fh:
+            fh.write("pass\n")
+
+        fake = CompletedProcess(
+            args=["python3", "-m", "py_compile", f],
+            returncode=1, stdout="",
+            stderr="other.py:5: invalid syntax\n",
+        )
+        with patch("server.subprocess.run", return_value=fake):
+            r = await server.lint_file(f)
+        check("Cross-file location not used",
+              "valid.py:5" not in r, r[:400])
+
+        fake2 = CompletedProcess(
+            args=["python3", "-m", "py_compile", f],
+            returncode=1, stdout="",
+            stderr="worker configuration error, line 1: invalid settings\n",
+        )
+        with patch("server.subprocess.run", return_value=fake2):
+            r = await server.lint_file(f)
+        check("Generic 'line N' not treated as source location",
+              "valid.py:1" not in r, r[:400])
 
 
 if __name__ == "__main__":
