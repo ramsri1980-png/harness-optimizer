@@ -695,6 +695,46 @@ async def test_legacy_commands_preserved_with_warning():
               "legacy" in out.lower(), out[:400])
         check("New harness-help.md installed",
               (cmds / "harness-help.md").exists())
+async def test_command_manifest_blocks_overwrite_of_user_file():
+    print("\n[Test 34] user-owned harness-*.md preserved on install (0.4.1)")
+    with tempfile.TemporaryDirectory() as fake_home:
+        home = pathlib.Path(fake_home)
+        cmds = home / ".config" / "opencode" / "commands"
+        cmds.mkdir(parents=True)
+
+        # User pre-owns a harness-plan.md with their own content
+        (cmds / "harness-plan.md").write_text("# MY OWN\n")
+
+        run_installer(home, "--no-runtime")
+
+        check("User file not overwritten",
+              (cmds / "harness-plan.md").read_text() == "# MY OWN\n")
+        check("Other 3 harness-* files installed",
+              (cmds / "harness-config.md").exists()
+              and (cmds / "harness-rollback-confirm.md").exists()
+              and (cmds / "harness-help.md").exists())
+
+
+async def test_command_manifest_preserves_edits_on_uninstall():
+    print("\n[Test 35] edited harness-*.md preserved on uninstall (0.4.1)")
+    with tempfile.TemporaryDirectory() as fake_home:
+        home = pathlib.Path(fake_home)
+        run_installer(home, "--no-runtime")
+        cmds = home / ".config" / "opencode" / "commands"
+
+        # Edit one file
+        with open(cmds / "harness-help.md", "a") as f:
+            f.write("\nMY EDIT\n")
+
+        run_installer(home, "--uninstall")
+
+        check("Edited file preserved",
+              (cmds / "harness-help.md").exists()
+              and "MY EDIT" in (cmds / "harness-help.md").read_text())
+        check("Other 3 removed",
+              not (cmds / "harness-plan.md").exists()
+              and not (cmds / "harness-config.md").exists()
+              and not (cmds / "harness-rollback-confirm.md").exists())
 
 
 
@@ -735,7 +775,8 @@ async def main():
     await test_force_preserves_custom_providers()
     await test_harness_commands_installed()
     await test_legacy_commands_preserved_with_warning()
-
+    await test_command_manifest_blocks_overwrite_of_user_file()
+    await test_command_manifest_preserves_edits_on_uninstall()
 
 
     print("\n" + "=" * 60)

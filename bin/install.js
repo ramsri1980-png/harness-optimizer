@@ -22,6 +22,7 @@ const FLAGS = {
   force:     process.argv.includes("--force"),
   help:      process.argv.includes("--help") || process.argv.includes("-h"),
   noRuntime: process.argv.includes("--no-runtime"),
+  withPlugins: process.argv.includes("--with-plugins"),
 };
 // ── Helpers ──
 function sha256(buf) {
@@ -37,6 +38,21 @@ function readMarkerHash(markerPath) {
   } catch {
     return null;
   }
+}
+const COMMANDS_MANIFEST = path.join(CONFIG_DIR, ".harness-commands.json");
+
+function loadCommandsManifest() {
+  if (!fs.existsSync(COMMANDS_MANIFEST)) return { files: {} };
+  try {
+    const parsed = JSON.parse(fs.readFileSync(COMMANDS_MANIFEST, "utf8"));
+    return parsed && typeof parsed === "object" && parsed.files ? parsed : { files: {} };
+  } catch {
+    return { files: {} };
+  }
+}
+
+function saveCommandsManifest(m) {
+  fs.writeFileSync(COMMANDS_MANIFEST, JSON.stringify(m, null, 2) + "\n");
 }
 
 const C = {
@@ -128,12 +144,28 @@ if (FLAGS.uninstall) {
       warn(`Could not parse opencode.json — left untouched: ${e.message}`);
     }
   }
+
+  // Remove harness-* commands only if the user hasn't edited them.
+  const uninstallManifest = loadCommandsManifest();
+  for (const [cmd, recordedHash] of Object.entries(uninstallManifest.files || {})) {
+    const f = path.join(COMMANDS_DIR, cmd);
+    if (!fs.existsSync(f)) continue;
+    const currentHash = sha256(fs.readFileSync(f));
+    if (currentHash === recordedHash) {
+      fs.rmSync(f);
+      info(`Removed ${f}`);
+    } else {
+      warn(`${cmd} has local edits — preserved, not removed.`);
+    }
+  }
+  if (fs.existsSync(COMMANDS_MANIFEST)) {
+    fs.rmSync(COMMANDS_MANIFEST);
+    info("Removed commands manifest.");
+  }
+
+  // Other harness-owned files (not tracked by the manifest).
   for (const f of [
     path.join(PLUGINS_DIR, "harness.ts"),
-    path.join(COMMANDS_DIR, "harness-plan.md"),
-    path.join(COMMANDS_DIR, "harness-config.md"),
-    path.join(COMMANDS_DIR, "harness-rollback-confirm.md"),
-    path.join(COMMANDS_DIR, "harness-help.md"),
     path.join(CONFIG_DIR, "opencode-fallback.jsonc"),
     path.join(CONFIG_DIR, "opencode-context-watch.json"),
     METRICS_FILE,
@@ -416,21 +448,8 @@ if (cfg.provider && !cfg.providers) {
 }
 
 if (!cfg.providers) {
-  cfg.providers = {
-    openrouter: {
-      package: "@opencode/ai/providers/openai-compatible",
-      settings: { baseURL: "https://openrouter.ai/api/v1" },
-    },
-    "orca-router": {
-      package: "@opencode/ai/providers/openai-compatible",
-      settings: { baseURL: "https://orcarouter.xyz/api/v1" },
-    },
-    "nvda-gate": {
-      package: "@opencode/ai/providers/openai-compatible",
-      settings: { baseURL: "https://nvidia.com/api/v1" },
-    },
-  };
-  info("Wrote default providers (none existed).");
+  cfg.providers = {};
+  info("No providers configured — set them via /harness-config or your OpenCode config.");
 } else {
   info("Existing providers preserved.");
 }
@@ -442,28 +461,10 @@ if (cfg.agent && !cfg.agents) {
   delete cfg.agent;
 }
 
+
 if (!cfg.agents) {
-  cfg.agents = {
-    primary: {
-      description: "Primary coding agent using Harness-Optimizer tools.",
-      model: "openrouter/deepseek/deepseek-chat",
-      fallback_models: ["orca-router/glm-4", "nvda-gate/thm/glm-4-plus"],
-    },
-    "initial-reviewer": {
-      description: "Read-only code review.",
-      model: "nvda-gate/thm/glm-4-plus",
-      fallback_models: ["orca-router/glm-4"],
-    },
-    "premier-reviewer": {
-      description: "High-context compliance audit.",
-      model: "openrouter/anthropic/claude-3-5-sonnet",
-    },
-    tester: {
-      description: "Runs tests and validates code safety gates.",
-      model: "orca-router/glm-4-flash",
-    },
-  };
-  info("Wrote default agents (none existed).");
+  cfg.agents = {};
+  info("No agents configured — set them via /harness-config or your OpenCode config.");
 } else {
   info("Existing agents preserved.");
 }
@@ -522,12 +523,39 @@ if (legacyPresent.length > 0) {
   warn("These are no longer used by harness-optimizer. They are preserved (not deleted) because they may contain your own content. You may remove them manually.");
 }
 
-for (const cmd of ["harness-plan.md", "harness-config.md", "harness-rollback-confirm.md", "harness-help.md"]) {
+const commandsManifest = loadCommandsManifest();
+const commandFiles = ["harness-plan.md", "harness-config.md", "harness-rollback-confirm.md", "harness-help.md"];
+
+for (const cmd of commandFiles) {
   const src = path.join(__dirname, "..", "templates", "commands", cmd);
+  const dst = path.join(COMMANDS_DIR, cmd);
   if (!fs.existsSync(src)) { warn(`Missing template: ${cmd}`); continue; }
-  fs.copyFileSync(src, path.join(COMMANDS_DIR, cmd));
-  info(`Installed ${cmd}`);
+
+  const templateBuf = fs.readFileSync(src);
+  const templateHash = sha256(templateBuf);
+  const existingHash = fs.existsSync(dst) ? sha256(fs.readFileSync(dst)) : null;
+  const recordedHash = commandsManifest.files[cmd] || null;
+
+  if (existingHash === null) {
+    fs.copyFileSync(src, dst);
+    commandsManifest.files[cmd] = templateHash;
+    info(`Installed ${cmd}`);
+  } else if (recordedHash === null) {
+    warn(`${cmd} exists and is not harness-owned — preserved, skipped.`);
+  } else if (existingHash === recordedHash) {
+    if (existingHash === templateHash) {
+      info(`${cmd} already up to date.`);
+    } else {
+      fs.copyFileSync(src, dst);
+      commandsManifest.files[cmd] = templateHash;
+      info(`Updated ${cmd}`);
+    }
+  } else {
+    warn(`${cmd} has local edits — preserved, not updated. Delete it and reinstall to get the latest version.`);
+  }
 }
+
+saveCommandsManifest(commandsManifest);
 
 head("Phase: Global AGENTS.md");
 const agentsSrc = path.join(__dirname, "..", "templates", "AGENTS.md");
@@ -598,7 +626,7 @@ if (!fs.existsSync(agentsDst)) {
   }
 }
 
-if (!FLAGS.noRuntime) {
+if (!FLAGS.noRuntime && FLAGS.withPlugins) {
 head("Phase: OpenCode Plugins via npm");
 for (const pkg of ["opencode-runtime-fallback", "opencode-context-watch", "opencode-studio-server"]) {
   info(`Installing ${pkg}...`);
@@ -648,7 +676,7 @@ console.log(`  Backup:   ${BACKUP_DIR}`);
 console.log(`  Docs:     ${docsDst}`);
 console.log("");
 console.log("Next steps:");
-console.log("  1. export OPENROUTER_API_KEY=...");
+console.log("  1. Configure providers and agents via /harness-config (or your OpenCode config)");
 console.log("  2. opencode");
 console.log("  3. Ask: 'List your available tools'");
 console.log("  4. Type: /harness-help");
