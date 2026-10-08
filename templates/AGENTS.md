@@ -22,6 +22,12 @@ Use the smallest sufficient context — not the smallest possible excerpt.
   after each coherent change. Preserve required regression tests and
   final acceptance checks. Reuse earlier evidence only while it remains
   applicable and current.
+- **Test output**: prefer concise-output flags supported by the repo's
+  existing test runner (e.g., `-q --tb=short` for pytest). Preserve the
+  exit code, failure summary, warnings, and required acceptance checks.
+  When the concise output is insufficient, rerun the specific failing
+  test with full diagnostics. Do not add a summarization tool or hide
+  errors to shorten output.
 - **Milestones**: call `git_checkpoint` at meaningful milestones, not
   after every edit.
 - **Lint scope**: `lint_file` performs Python syntax compilation

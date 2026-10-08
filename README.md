@@ -87,6 +87,35 @@ routers and small models hallucinate parameter names (e.g., `path` instead of
 happens, tool calls fail silently or the metric doesn't display.
 
 **Recommended models:** DeepSeek V3/V4, Claude Sonnet/Opus, GPT-4/4o, or any
+
+## Reducing Tool Overhead
+
+Every enabled MCP tool occupies space in the model's tool list. In a
+repository where a specific tool is not useful — for example, a non-git
+repo doesn't need `git_checkpoint`, a Python-only repo may not need
+`inspect_database_schema` — you can disable it:
+
+**Option A — config UI**: run `/config`, uncheck the tools you don't
+need, save. Restart OpenCode.
+
+**Option B — env var**: in `~/.config/opencode/opencode.json`, set:
+
+    "mcp": {
+      "servers": {
+        "harness-tools": {
+          "environment": {
+            "HARNESS_TOOLS": "rip_file_lines,apply_search_replace,get_repo_skeleton"
+          }
+        }
+      }
+    }
+
+Use `HARNESS_TOOLS=none` to disable all tools, or a comma-separated list
+of specific tool names. Disabled tools are not registered with the MCP
+client — the model never sees them.
+
+Restart OpenCode after changing this setting.
+
 ## License
 
 MIT

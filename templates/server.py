@@ -72,6 +72,15 @@ async def get_repo_skeleton(repo_path: str = ".", max_files: int = 500):
                  "node_modules", "dist", "build", ".tox", ".mypy_cache",
                  ".pytest_cache", "site-packages"}
 
+    def symbol_span(node) -> str:
+        # Inclusive start: decorator line if decorated, else def/class line.
+        start = node.lineno
+        decs = getattr(node, "decorator_list", None) or []
+        if decs:
+            start = min(start, min(d.lineno for d in decs))
+        end = getattr(node, "end_lineno", None) or start
+        return f"[L{start}-L{end}]"
+
     skeleton_lines = []
     total_raw_chars = 0
     file_count = 0
@@ -96,23 +105,23 @@ async def get_repo_skeleton(repo_path: str = ".", max_files: int = 500):
                 continue
 
             skeleton_lines.append(f"{rel}:")
-            for node in ast.walk(tree):
+            for node in tree.body:
                 if isinstance(node, ast.ClassDef):
-                    skeleton_lines.append(f"  class {node.name}:")
+                    skeleton_lines.append(
+                        f"  class {node.name}: {symbol_span(node)}"
+                    )
                     for sub in node.body:
                         if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
                             args = [a.arg for a in sub.args.args]
+                            prefix = "async def" if isinstance(sub, ast.AsyncFunctionDef) else "def"
                             skeleton_lines.append(
-                                f"    def {sub.name}({', '.join(args)}):"
+                                f"    {prefix} {sub.name}({', '.join(args)}): {symbol_span(sub)}"
                             )
                 elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    # Skip methods: already handled inside ClassDef
-                    if any(isinstance(p, ast.ClassDef) for p in ast.walk(tree)
-                           if hasattr(p, "body") and node in getattr(p, "body", [])):
-                        continue
                     args = [a.arg for a in node.args.args]
+                    prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
                     skeleton_lines.append(
-                        f"  def {node.name}({', '.join(args)}):"
+                        f"  {prefix} {node.name}({', '.join(args)}): {symbol_span(node)}"
                     )
 
     skeleton_text = "\n".join(skeleton_lines)
@@ -155,31 +164,118 @@ async def rip_file_lines(file_path: str, start_line: int, end_line: int, ctx: Co
     except Exception as exc:
         return f"Failed to rip file ranges: {exc}"
 
-
 @register("find_dependent_references")
-async def find_dependent_references(target_symbol: str, repo_path: str) -> str:
-    """Scan a repo for imports or callers of a symbol before changing it.
-    Read-only. Returns file:line → matching text for every hit."""
-    repo_path = os.path.expanduser(repo_path)
-    found: list[str] = []
-    for root, _, files in os.walk(repo_path):
-        if any(p in root for p in ["venv", ".git", "__pycache__", "node_modules"]):
-            continue
-        for file in sorted(files):
+async def find_dependent_references(
+    target_symbol: str,
+    repo_path: str,
+    max_results: int = 40,
+    max_chars: int = 8000,
+) -> str:
+    """Bounded text search for a symbol in Python files.
+
+    This is a substring search, NOT proof of callers or semantic
+    dependencies. It matches any line containing the symbol text,
+    including comments and strings. Use it as a hint, not a verdict.
+
+    Args:
+        target_symbol: text to search for (non-empty, not whitespace-only).
+        repo_path: repository root to search (must be a directory).
+        max_results: cap on returned matches (default 40, min 1).
+        max_chars: total response size cap in characters (default 8000,
+            min 256). Applied cumulatively to header + matches + warning.
+
+    Returns matches sorted by file path then line number. If either limit
+    truncates the result, the response says so explicitly and suggests how
+    to narrow the search.
+    """
+    if not target_symbol or not target_symbol.strip():
+        return "ERROR: target_symbol must be non-empty and not whitespace-only."
+    if max_results < 1:
+        return "ERROR: max_results must be >= 1."
+    if max_chars < 256:
+        return "ERROR: max_chars must be >= 256."
+
+    root_path = os.path.abspath(os.path.expanduser(repo_path))
+    if not os.path.isdir(root_path):
+        return f"ERROR: Not a directory: {root_path}"
+
+    SKIP_DIRS = {"venv", ".venv", "env", ".git", "__pycache__",
+                 "node_modules", "dist", "build", ".tox", ".mypy_cache",
+                 ".pytest_cache", "site-packages"}
+
+    matches: list[str] = []
+    overflow_by_count = False
+    cap = max_results + 1  # collect one extra to detect truncation
+
+    for dirpath, dirnames, filenames in os.walk(root_path):
+        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+        for file in sorted(filenames):
             if not file.endswith(".py"):
                 continue
-            f_path = os.path.join(root, file)
+            if len(matches) >= cap:
+                overflow_by_count = True
+                break
+            f_path = os.path.join(dirpath, file)
             try:
-                with open(f_path, "r", encoding="utf-8") as f:
+                with open(f_path, "r", encoding="utf-8", errors="ignore") as f:
                     for idx, line in enumerate(f, 1):
                         if target_symbol in line:
-                            rel = os.path.relpath(f_path, repo_path)
-                            found.append(f"{rel}:{idx} → {line.strip()}")
+                            rel = os.path.relpath(f_path, root_path)
+                            matches.append(f"{rel}:{idx} \u2192 {line.rstrip()}")
+                            if len(matches) >= cap:
+                                overflow_by_count = True
+                                break
             except Exception:
                 continue
-    if not found:
-        return f"No references found for '{target_symbol}'."
-    return "\n".join(found)
+            if overflow_by_count:
+                break
+        if overflow_by_count:
+            break
+
+    if not matches:
+        return f"No text matches for '{target_symbol}' in the searched scope."
+
+    truncated_by_count = overflow_by_count and len(matches) > max_results
+    if truncated_by_count:
+        matches = matches[:max_results]
+
+    header = (
+        f"# find_dependent_references: '{target_symbol}' "
+        f"({len(matches)} match{'es' if len(matches) != 1 else ''})\n"
+        f"# Text match only \u2014 not proof of callers. Includes comments/strings."
+    )
+
+    STATUS_RESERVE = 220  # bytes reserved for a truncation status line
+    body_budget = max_chars - len(header) - STATUS_RESERVE - 2
+
+    body: list[str] = []
+    body_used = 0
+    for line in matches:
+        projected = body_used + len(line) + 1
+        if projected > body_budget:
+            break
+        body.append(line)
+        body_used = projected
+
+    char_truncated = len(body) < len(matches)
+
+    status_parts = []
+    if truncated_by_count:
+        status_parts.append(f"count limit {max_results} reached")
+    if char_truncated:
+        status_parts.append(f"char limit {max_chars} reached")
+
+    out_lines = [header] + body
+    if status_parts:
+        out_lines.append(
+            f"# Truncated: {'; '.join(status_parts)}. "
+            f"Narrow the symbol or subdirectory, or increase max_results/max_chars."
+        )
+
+    response = "\n".join(out_lines)
+    if len(response) > max_chars:
+        response = response[: max_chars - 40] + "\n# ... hard-clipped to max_chars"
+    return response
 
 
 # ═══════════════════════════════════════════════════════════

@@ -466,6 +466,54 @@ async def test_managed_section_update_still_works():
               "CORRUPTED" not in after)
         check("User content outside markers preserved",
               "Personal section" in after and "Keep this forever." in after)
+async def test_skeleton_includes_line_ranges():
+    print("\n[Test 24] Skeleton includes line ranges (0.3.0 #1)")
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "sample.py"), "w") as f:
+            f.write(
+                "def top():\n    return 1\n\n"
+                "async def async_top():\n    return 2\n\n"
+                "class Foo:\n"
+                "    def method(self):\n        pass\n"
+                "    async def async_method(self):\n        pass\n"
+            )
+        out = await server.get_repo_skeleton(repo_path=d)
+        check("Line range present for top()", "[L1-L2]" in out, out[:400])
+        check("Class has range", "class Foo" in out and "[L" in out, out[:400])
+        check("Async prefix used", "async def" in out, out[:400])
+        check("Method has its own range", out.count("[L") >= 4, out[:400])
+
+async def test_find_refs_rejects_empty():
+    print("\n[Test 25] find_dependent_references rejects empty (0.3.0 #2)")
+    with tempfile.TemporaryDirectory() as d:
+        r1 = await server.find_dependent_references("", d)
+        r2 = await server.find_dependent_references("   ", d)
+        check("Empty symbol rejected", r1.startswith("ERROR:"), r1)
+        check("Whitespace symbol rejected", r2.startswith("ERROR:"), r2)
+async def test_find_refs_enforces_limits():
+    print("\n[Test 26] find_dependent_references enforces limits (0.3.0 #2)")
+    with tempfile.TemporaryDirectory() as d:
+        for i in range(60):
+            with open(os.path.join(d, f"f{i:02d}.py"), "w") as f:
+                f.write("findme_token = 1\n" * 3)
+        r = await server.find_dependent_references(
+            "findme_token", d, max_results=5, max_chars=8000)
+        check("Count limit reported", "count limit 5" in r, r[:300])
+        r = await server.find_dependent_references(
+            "findme_token", d, max_results=500, max_chars=300)
+        check("Char budget enforced", len(r) <= 300, f"got {len(r)}")
+        r = await server.find_dependent_references("x", d, max_results=0)
+        check("max_results=0 rejected", r.startswith("ERROR:"), r)
+        r = await server.find_dependent_references("x", d, max_chars=100)
+        check("max_chars=100 rejected", r.startswith("ERROR:"), r)
+
+async def test_find_refs_no_matches():
+    print("\n[Test 27] find_dependent_references no-match message (0.3.0 #2)")
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "one.py"), "w") as f:
+            f.write("a = 1\n")
+        r = await server.find_dependent_references("never_here_xyz", d)
+        check("No-match message present", "No text matches" in r, r[:200])
 
 
 async def main():
@@ -495,7 +543,10 @@ async def main():
     await test_reversed_markers_rejected()
     await test_backup_and_unmarked_file_leaves_both()
     await test_managed_section_update_still_works()
-
+    await test_skeleton_includes_line_ranges()
+    await test_find_refs_rejects_empty()
+    await test_find_refs_enforces_limits()
+    await test_find_refs_no_matches()
 
     print("\n" + "=" * 60)
     passed = sum(1 for _, ok in results if ok)
