@@ -663,7 +663,38 @@ async def test_force_preserves_custom_providers():
               "customagent" in after.get("agents", {}),
               list(after.get("agents", {}).keys()))
 
+async def test_harness_commands_installed():
+    print("\n[Test 32] harness-* commands installed (0.4.0)")
+    with tempfile.TemporaryDirectory() as fake_home:
+        home = pathlib.Path(fake_home)
+        run_installer(home, "--no-runtime")
+        cmds = home / ".config" / "opencode" / "commands"
+        for name in ["harness-plan.md", "harness-config.md",
+                     "harness-rollback-confirm.md", "harness-help.md"]:
+            check(f"{name} installed", (cmds / name).exists())
 
+
+async def test_legacy_commands_preserved_with_warning():
+    print("\n[Test 33] legacy commands preserved with warning (0.4.0)")
+    with tempfile.TemporaryDirectory() as fake_home:
+        home = pathlib.Path(fake_home)
+        cmds = home / ".config" / "opencode" / "commands"
+        cmds.mkdir(parents=True)
+
+        # Simulate pre-0.4.0 files with user content
+        (cmds / "plan.md").write_text("# user's own plan command\n")
+        (cmds / "help-harness.md").write_text("# user's own help command\n")
+
+        rc, out = run_installer(home, "--no-runtime")
+
+        check("Legacy plan.md preserved",
+              (cmds / "plan.md").read_text() == "# user's own plan command\n")
+        check("Legacy help-harness.md preserved",
+              (cmds / "help-harness.md").read_text() == "# user's own help command\n")
+        check("Warning mentions legacy files",
+              "legacy" in out.lower(), out[:400])
+        check("New harness-help.md installed",
+              (cmds / "harness-help.md").exists())
 
 
 
@@ -702,6 +733,9 @@ async def main():
     await test_find_refs_header_count_accurate()
     await test_find_refs_preserves_location_under_small_budget()
     await test_force_preserves_custom_providers()
+    await test_harness_commands_installed()
+    await test_legacy_commands_preserved_with_warning()
+
 
 
     print("\n" + "=" * 60)

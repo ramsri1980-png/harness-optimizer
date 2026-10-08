@@ -130,10 +130,10 @@ if (FLAGS.uninstall) {
   }
   for (const f of [
     path.join(PLUGINS_DIR, "harness.ts"),
-    path.join(COMMANDS_DIR, "plan.md"),
-    path.join(COMMANDS_DIR, "config.md"),
-    path.join(COMMANDS_DIR, "rollback-confirm.md"),
-    path.join(COMMANDS_DIR, "help-harness.md"),
+    path.join(COMMANDS_DIR, "harness-plan.md"),
+    path.join(COMMANDS_DIR, "harness-config.md"),
+    path.join(COMMANDS_DIR, "harness-rollback-confirm.md"),
+    path.join(COMMANDS_DIR, "harness-help.md"),
     path.join(CONFIG_DIR, "opencode-fallback.jsonc"),
     path.join(CONFIG_DIR, "opencode-context-watch.json"),
     METRICS_FILE,
@@ -263,7 +263,7 @@ asyncio.run(main())
       check("opencode.json parses", false, e.message);
     }
   }
-  for (const cmd of ["plan.md", "config.md", "rollback-confirm.md", "help-harness.md"]) {
+  for (const cmd of ["harness-plan.md", "harness-config.md", "harness-rollback-confirm.md", "harness-help.md"]) {
     check(`command: ${cmd}`, fs.existsSync(path.join(COMMANDS_DIR, cmd)));
   }
   check("harness.ts plugin",
@@ -510,7 +510,19 @@ if (!fs.existsSync(METRICS_FILE)) {
 }
 
 head("Phase: Custom Commands");
-for (const cmd of ["plan.md", "config.md", "rollback-confirm.md", "help-harness.md"]) {
+// Warn about legacy 0.3.x command files. We do not delete them — the user
+// may have owned some of those names before harness ever existed.
+const legacyCommandNames = ["plan.md", "config.md", "rollback-confirm.md", "help-harness.md"];
+const legacyPresent = legacyCommandNames
+  .map(c => path.join(COMMANDS_DIR, c))
+  .filter(f => fs.existsSync(f));
+if (legacyPresent.length > 0) {
+  warn(`Found ${legacyPresent.length} legacy command file(s) from a pre-0.4.0 install:`);
+  for (const f of legacyPresent) warn(`  ${f}`);
+  warn("These are no longer used by harness-optimizer. They are preserved (not deleted) because they may contain your own content. You may remove them manually.");
+}
+
+for (const cmd of ["harness-plan.md", "harness-config.md", "harness-rollback-confirm.md", "harness-help.md"]) {
   const src = path.join(__dirname, "..", "templates", "commands", cmd);
   if (!fs.existsSync(src)) { warn(`Missing template: ${cmd}`); continue; }
   fs.copyFileSync(src, path.join(COMMANDS_DIR, cmd));
@@ -639,7 +651,7 @@ console.log("Next steps:");
 console.log("  1. export OPENROUTER_API_KEY=...");
 console.log("  2. opencode");
 console.log("  3. Ask: 'List your available tools'");
-console.log("  4. Type: /help-harness");
+console.log("  4. Type: /harness-help");
 console.log("");
 console.log("Health check:  npx harness-optimizer --doctor");
 console.log("Uninstall:     npx harness-optimizer --uninstall");

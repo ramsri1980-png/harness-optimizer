@@ -2,7 +2,7 @@
 description: Show a fresh rollback preview. Does not execute rollback.
 ---
 
-The user has invoked /rollback-confirm. This command NO LONGER executes a
+The user has invoked /harness-rollback-confirm. This command NO LONGER executes a
 destructive rollback. It produces a fresh preview so the user can decide
 what to do next.
 
@@ -27,5 +27,5 @@ what to do next.
   asks.
 - Do NOT modify any files in the repository.
 
-Invoking /rollback-confirm is a request for a current preview — not
+Invoking /harness-rollback-confirm is a request for a current preview — not
 authorization to discard work.

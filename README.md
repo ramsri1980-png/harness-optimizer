@@ -41,7 +41,7 @@ Then restart OpenCode. Ask: `List your available tools.`
   returned excerpt), not a measured end-to-end token saving.
 - Global AGENTS.md — token protocol, context pressure protocol, plan mode,
   rollback protocol, metric echo rule
-- Custom commands: /plan, /config, /rollback-confirm, /help-harness
+- Custom commands: /harness-plan, /harness-config, /harness-rollback-confirm, /harness-help
 
 ## Requirements
 
@@ -95,7 +95,7 @@ repository where a specific tool is not useful — for example, a non-git
 repo doesn't need `git_checkpoint`, a Python-only repo may not need
 `inspect_database_schema` — you can disable it:
 
-**Option A — config UI**: run `/config`, uncheck the tools you don't
+**Option A — config UI**: run `/harness-config`, uncheck the tools you don't
 need, save. Restart OpenCode.
 
 **Option B — env var**: in `~/.config/opencode/opencode.json`, set:

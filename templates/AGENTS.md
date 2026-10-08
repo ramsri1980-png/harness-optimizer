@@ -114,9 +114,9 @@ Instead:
 `openspec/` or `.openspec/` directory contains an approved change),
 treat that OpenSpec change as the single planning authority. Do not
 create a competing `.opencode/plan.md`. Follow the OpenSpec plan and
-its tasks. `/plan` is for work that has no OpenSpec plan.
+its tasks. `/harness-plan` is for work that has no OpenSpec plan.
 
-When the user types `/plan <task>`, produce a written implementation plan
+When the user types `/harness-plan <task>`, produce a written implementation plan
 and write it to `.opencode/plan.md`, then STOP. Do not begin implementation.
 
 Once the user approves the plan (any affirmative reply), immediately read
