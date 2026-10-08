@@ -85,12 +85,23 @@ permissions and isolated test data.
 
 **Statuses.**
 - **VERIFIED** — current checks support the stated scenario.
-- **FAIL** — implementation or results contradict the requirement.
+- **FAIL** — the implementation is present and contradicts the
+  requirement, OR required behavior is entirely absent (no code path
+  could satisfy the requirement).
 - **UNVERIFIED** — evidence is missing, insufficient, stale, skipped,
-  or unavailable.
+  or unavailable, but an implementation might exist that satisfies the
+  requirement.
 - **BLOCKED BY AMBIGUITY** — expected behavior cannot be established.
 
 Do not present syntax compilation alone as behavioral verification.
+
+**Dependency discipline.** Do not install new dependencies, upgrade
+existing ones, or access external services during verification without
+explicit user approval. If a required test runner or tool is missing,
+report it and ask how to proceed. Use the repository's existing
+environment; do not create a new virtualenv, install globally, or run
+`pip install` / `npm install` without approval.
+
 
 **Review boundaries.** Report findings in chat and stop. During
 verification, do not edit implementation, tests, requirements, or task
