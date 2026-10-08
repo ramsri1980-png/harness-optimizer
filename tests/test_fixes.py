@@ -586,6 +586,49 @@ async def test_find_refs_no_matches():
         finally:
             os.chmod(target, 0o644)
 
+async def test_find_refs_hard_budget():
+    print("\n[Test 28] find_refs respects max_chars=256 (0.3.2)")
+    with tempfile.TemporaryDirectory() as d:
+        for i in range(10):
+            with open(os.path.join(d, f"f{i}.py"), "w") as f:
+                f.write("symbol=1\n")
+        r = await server.find_dependent_references("symbol", d, max_chars=256)
+        check("Response under 256 chars", len(r) <= 256, f"{len(r)} chars")
+
+
+async def test_find_refs_header_count_accurate():
+    print("\n[Test 29] find_refs header count == visible count (0.3.2)")
+    import re
+    with tempfile.TemporaryDirectory() as d:
+        for i in range(40):
+            with open(os.path.join(d, f"f{i:02d}.py"), "w") as f:
+                f.write("symbol = " + "x" * 80 + "\n")
+        r = await server.find_dependent_references("symbol", d)
+        first_line = r.split("\n")[0]
+        m = re.search(r"\((\d+) match", first_line)
+        header_count = int(m.group(1)) if m else -1
+        body_count = sum(
+            1 for l in r.split("\n")[1:]
+            if l and not l.startswith("#")
+        )
+        check("Header count matches visible",
+              header_count == body_count,
+              f"header={header_count}, visible={body_count}")
+
+
+async def test_find_refs_preserves_location_under_small_budget():
+    print("\n[Test 30] find_refs keeps filename:line under budget (0.3.2)")
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "a.py"), "w") as f:
+            f.write('symbol = "' + "x" * 2000 + '"\n')
+            f.write("symbol = short\n")
+        r = await server.find_dependent_references("symbol", d, max_chars=300)
+        check("Under budget", len(r) <= 300, f"{len(r)} chars")
+        check("First match location present", "a.py:1" in r, r[:300])
+        check("Second match location present", "a.py:2" in r, r[:300])
+
+
+
 
 async def main():
     print("=" * 60)
@@ -618,6 +661,11 @@ async def main():
     await test_find_refs_rejects_empty()
     await test_find_refs_enforces_limits()
     await test_find_refs_no_matches()
+    await test_find_refs_hard_budget()
+    await test_find_refs_header_count_accurate()
+    await test_find_refs_preserves_location_under_small_budget()
+
+
 
     print("\n" + "=" * 60)
     passed = sum(1 for _, ok in results if ok)

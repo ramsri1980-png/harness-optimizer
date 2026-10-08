@@ -191,16 +191,6 @@ async def find_dependent_references(
     Substring search, NOT semantic dependency analysis. Matches any
     line containing the symbol text, including comments and strings.
     Use as a hint, not a verdict.
-
-    Args:
-        target_symbol: text to search for (non-empty, not whitespace-only).
-        repo_path: repository root to search (must be a directory).
-        max_results: cap on returned matches (default 40, min 1).
-        max_chars: total response size cap in characters (default 8000,
-            min 256). Applies to header + matches + status line.
-
-    Reports truncation explicitly and notes unreadable files so the
-    caller knows whether the search was complete.
     """
     if not target_symbol or not target_symbol.strip():
         return "ERROR: target_symbol must be non-empty and not whitespace-only."
@@ -217,17 +207,11 @@ async def find_dependent_references(
                  "node_modules", "dist", "build", ".tox", ".mypy_cache",
                  ".pytest_cache", "site-packages"}
 
-    PER_LINE_MAX = 200
     SYMBOL_DISPLAY_MAX = 80
+    PER_LINE_MAX = 200
+    HARD_CLIP_SUFFIX = "\n# ... hard-clipped to max_chars"
 
-    def shorten_match(match: str) -> str:
-        if " \u2192 " in match:
-            loc, _, text = match.partition(" \u2192 ")
-            if len(text) > PER_LINE_MAX:
-                text = text[: PER_LINE_MAX - 3] + "..."
-            return f"{loc} \u2192 {text}"
-        return match
-
+    # ── collect matches ──
     matches: list[str] = []
     overflow_by_count = False
     unreadable_count = 0
@@ -259,9 +243,24 @@ async def find_dependent_references(
         if overflow_by_count:
             break
 
+    # ── helpers ──
     symbol_display = target_symbol
     if len(symbol_display) > SYMBOL_DISPLAY_MAX:
         symbol_display = symbol_display[: SYMBOL_DISPLAY_MAX - 3] + "..."
+
+    def hard_clip(text: str) -> str:
+        if len(text) <= max_chars:
+            return text
+        if max_chars <= len(HARD_CLIP_SUFFIX):
+            return text[:max_chars]
+        return text[: max_chars - len(HARD_CLIP_SUFFIX)] + HARD_CLIP_SUFFIX
+
+    def shorten_text(text: str, limit: int) -> str:
+        if len(text) <= limit:
+            return text
+        if limit <= 3:
+            return text[:limit]
+        return text[: limit - 3] + "..."
 
     truncated_by_count = overflow_by_count and len(matches) > max_results
     if truncated_by_count:
@@ -271,7 +270,9 @@ async def find_dependent_references(
     if truncated_by_count:
         base_status_bits.append(f"count limit {max_results} reached")
     if unreadable_count > 0:
-        base_status_bits.append(f"{unreadable_count} file(s) unreadable; search may be incomplete")
+        base_status_bits.append(
+            f"{unreadable_count} file(s) unreadable; search may be incomplete"
+        )
 
     def build_status(extra: str = "") -> str:
         bits = base_status_bits[:]
@@ -279,61 +280,89 @@ async def find_dependent_references(
             bits.append(extra)
         if not bits:
             return ""
-        return ("\n# Truncated: " + "; ".join(bits)
-                + ". Narrow the symbol or subdirectory, or increase max_results/max_chars.")
+        # Compact, single line; hard_clip protects total size.
+        return "\n# " + "; ".join(bits)
 
+    # ── no-match branch ──
     if not matches:
-        out = f"No text matches for '{symbol_display}' in the searched scope." + build_status()
-        if len(out) > max_chars:
-            out = out[: max_chars - 20] + "\n# ... clipped to max_chars"
-        return out
+        out = f"No text matches for '{symbol_display}' in the searched scope."
+        out += build_status()
+        return hard_clip(out)
 
-    word = "match" if len(matches) == 1 else "matches"
-    header = (
-        f"# find_dependent_references: '{symbol_display}' "
-        f"({len(matches)} {word} shown)\n"
-        f"# Text match only \u2014 not proof of callers or semantic dependencies."
-    )
-
-    matches = [shorten_match(m) for m in matches]
-
-    # Reserve for status line; scale down for small budgets.
-    probe = build_status("char limit 999999 reached (99999 more match(es) omitted)")
-    if max_chars >= 1000:
-        status_reserve = len(probe)
-    elif max_chars >= 500:
-        status_reserve = min(len(probe), 150)
-    else:
-        status_reserve = 0  # too tight; skip status and rely on header count
-
-    body_budget = max_chars - len(header) - status_reserve - 1
-    if body_budget < 40 and matches:
-        # Fallback: minimal header, drop the second descriptive line.
-        header = (f"# find_dependent_references: '{symbol_display}' "
-                  f"({len(matches)} {word})")
-        body_budget = max_chars - len(header) - status_reserve - 1
-
-    body_lines: list[str] = []
-    body_used = 0
-    skipped = 0
-    for i, match in enumerate(matches):
-        sep = 1 if body_lines else 0
-        if body_used + sep + len(match) <= body_budget:
-            body_lines.append(match)
-            body_used += sep + len(match)
+    # ── prepare (loc, text) pairs with per-line cap ──
+    prepared: list[tuple[str, str]] = []
+    for m in matches:
+        if " \u2192 " in m:
+            loc, _, text = m.partition(" \u2192 ")
+            prepared.append((loc, shorten_text(text, PER_LINE_MAX)))
         else:
-            skipped = len(matches) - i
+            prepared.append(("", m))
+
+    def make_header(n_shown: int) -> str:
+        word = "match" if n_shown == 1 else "matches"
+        return (
+            f"# find_dependent_references: '{symbol_display}' "
+            f"({n_shown} {word} shown)\n"
+            f"# Text match only \u2014 not proof of callers or semantic dependencies."
+        )
+
+    # ── fit matches greedily, keeping locations ──
+    body_lines: list[str] = []
+    skipped = 0
+
+    for i, (loc, text) in enumerate(prepared):
+        prospective = len(body_lines) + 1
+        header_len = len(make_header(prospective))
+        remaining = len(prepared) - prospective
+        extra_status = ""
+        if remaining > 0:
+            extra_status = (
+                f"char limit {max_chars} reached ({remaining} more match(es) omitted)"
+            )
+        status_len = len(build_status(extra_status)) if extra_status else 0
+        budget = max_chars - header_len - status_len - 1
+
+        sep = 1 if body_lines else 0
+        used = sum(len(x) for x in body_lines) + max(0, len(body_lines) - 1)
+        available = budget - used - sep
+
+        if available < 12:
+            skipped = len(prepared) - i
             break
 
+        full = f"{loc} \u2192 {text}" if loc else text
+
+        if len(full) <= available:
+            body_lines.append(full)
+            continue
+
+        # Try shortened form that keeps the location marker
+        if loc:
+            min_form = f"{loc} \u2192 ..."
+            if len(min_form) <= available:
+                overhead = len(loc) + len(" \u2192 ") + 3
+                keep = available - overhead
+                if keep > 0:
+                    body_lines.append(f"{loc} \u2192 {text[:keep]}...")
+                else:
+                    body_lines.append(min_form)
+                continue
+
+        skipped = len(prepared) - i
+        break
+
+    # ── build final output (accurate header count) ──
+    header = make_header(len(body_lines))
     extra = ""
     if skipped > 0:
         extra = f"char limit {max_chars} reached ({skipped} more match(es) omitted)"
 
-    out = header + "\n" + "\n".join(body_lines) + build_status(extra)
-    if len(out) > max_chars:
-        out = out[: max_chars - 20] + "\n# ... hard-clipped to max_chars"
-    return out
+    out = header
+    if body_lines:
+        out += "\n" + "\n".join(body_lines)
+    out += build_status(extra)
 
+    return hard_clip(out)
 
 # ═══════════════════════════════════════════════════════════
 # B. Surgical code modification
