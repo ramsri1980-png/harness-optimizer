@@ -629,6 +629,43 @@ async def test_find_refs_preserves_location_under_small_budget():
 
 
 
+async def test_force_preserves_custom_providers():
+    print("\n[Test 31] --force preserves custom providers (0.3.5)")
+    with tempfile.TemporaryDirectory() as fake_home:
+        import json
+        home = pathlib.Path(fake_home)
+        cfgdir = home / ".config" / "opencode"
+        cfgdir.mkdir(parents=True)
+
+        # Seed a config with a custom provider and agent
+        seeded = {
+            "providers": {
+                "openrouter": {
+                    "package": "@opencode/ai/providers/openai-compatible",
+                    "settings": {"baseURL": "https://openrouter.ai/api/v1"},
+                },
+                "customprovider": {
+                    "package": "@opencode/ai/providers/openai-compatible",
+                    "settings": {"baseURL": "https://example.com/v1"},
+                },
+            },
+            "agents": {"customagent": {"model": "customprovider/x"}},
+        }
+        (cfgdir / "opencode.json").write_text(json.dumps(seeded, indent=2))
+
+        rc, out = run_installer(home, "--force", "--no-runtime")
+
+        after = json.load(open(cfgdir / "opencode.json"))
+        check("Custom provider survived --force",
+              "customprovider" in after.get("providers", {}),
+              list(after.get("providers", {}).keys()))
+        check("Custom agent survived --force",
+              "customagent" in after.get("agents", {}),
+              list(after.get("agents", {}).keys()))
+
+
+
+
 
 async def main():
     print("=" * 60)
@@ -664,7 +701,7 @@ async def main():
     await test_find_refs_hard_budget()
     await test_find_refs_header_count_accurate()
     await test_find_refs_preserves_location_under_small_budget()
-
+    await test_force_preserves_custom_providers()
 
 
     print("\n" + "=" * 60)

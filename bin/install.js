@@ -343,7 +343,7 @@ fs.mkdirSync(COMMANDS_DIR, { recursive: true });
 fs.mkdirSync(PLUGINS_DIR, { recursive: true });
 
 let cfg = {};
-if (fs.existsSync(OPENCODE_JSON) && !FLAGS.force) {
+if (fs.existsSync(OPENCODE_JSON)) {
   try {
     cfg = JSON.parse(fs.readFileSync(OPENCODE_JSON, "utf8"));
     info("Existing opencode.json loaded — merging.");
