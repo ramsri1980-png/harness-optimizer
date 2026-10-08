@@ -63,6 +63,26 @@ or rerun checks when relevant state changed, evidence is missing, or
 correctness is uncertain. Do not blindly redo everything, and do not blindly
 trust stale evidence either.
 
+## Requirement Verification
+For work against explicit requirements — a requirements doc, an OpenSpec
+change, or a user-provided spec — verify before claiming completion.
+
+- **If an approved OpenSpec change is active**, use `openspec verify` as
+  the authority. Do not invent a parallel verification pass.
+- **Otherwise**, for each requirement or acceptance scenario, report:
+  - **Code evidence** — file:line references and the actual execution
+    path (not just a matching function name)
+  - **Test evidence** — the test name, its assertion, and the exact
+    command run with exit code and result summary
+  - **Status** — one of: VERIFIED, FAIL, UNVERIFIED, BLOCKED BY AMBIGUITY
+- **UNVERIFIED** means: code exists but no test exercises the required
+  behavior. Report it honestly instead of claiming done.
+- Do NOT substitute syntax checks (`lint_file`) or "looks correct" for
+  behavioral evidence.
+- This is a **review** step — report findings only. Do not edit
+  implementation, tests, requirements, task checkboxes, or commit.
+
+
 ## No Shell Bypass of Refused Edits
 If a harness-tools edit is refused (ambiguous search, empty search, missing
 target, safety guard), do NOT try to accomplish the same edit via

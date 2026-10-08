@@ -319,7 +319,7 @@ async def find_dependent_references(
             extra_status = (
                 f"char limit {max_chars} reached ({remaining} more match(es) omitted)"
             )
-        status_len = len(build_status(extra_status)) if extra_status else 0
+        status_len = len(build_status(extra_status))
         budget = max_chars - header_len - status_len - 1
 
         sep = 1 if body_lines else 0
