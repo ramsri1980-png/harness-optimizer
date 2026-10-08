@@ -220,18 +220,39 @@ async def apply_search_replace(file_path: str, search_block: str, replace_block:
 
 @register("lint_file")
 async def lint_file(file_path: str) -> str:
-    """Run py_compile on a single Python file. Returns 'Syntax clean'
-    or the compiler error message."""
-    if not os.path.exists(file_path):
-        return f"Error: File {file_path} not found."
-    res = subprocess.run(
-        ["python3", "-m", "py_compile", file_path],
-        capture_output=True, text=True, shell=False,
-    )
-    if res.returncode != 0:
-        return f"SYNTAX ERROR:\n{res.stderr.strip()}"
-    return f"Syntax clean: {os.path.basename(file_path)}"
+    """Python syntax check only (py_compile). Not a linter, type checker, or
+    behavioral test runner. Returns one of:
+      - OK: ... on successful Python syntax check
+      - FAIL: ... on syntax error or missing file
+      - SKIPPED: unsupported file type for non-.py files — use the
+        repository's own configured checks instead.
+    """
+    path = os.path.expanduser(file_path)
+    ext = os.path.splitext(path)[1].lower()
 
+    if ext != ".py":
+        shown = ext if ext else "(no extension)"
+        return (
+            f"SKIPPED: unsupported file type {shown} — use the repository's "
+            f"configured checks. lint_file only performs Python syntax checks."
+        )
+
+    if not os.path.exists(path):
+        return f"FAIL: file not found — {path}"
+
+    try:
+        res = subprocess.run(
+            ["python3", "-m", "py_compile", path],
+            capture_output=True, text=True, shell=False,
+        )
+    except FileNotFoundError:
+        return "FAIL: python3 not available on PATH; cannot run py_compile."
+
+    if res.returncode != 0:
+        detail = (res.stderr or "").strip() or "(no stderr)"
+        return f"FAIL: Python syntax error — {os.path.basename(path)}\n{detail}"
+
+    return f"OK: Python syntax check passed — {os.path.basename(path)}"
 
 @register("git_checkpoint")
 async def git_checkpoint(file_path: str, change_summary: str):
@@ -319,8 +340,8 @@ async def rollback_show(repo_path: str) -> str:
 
         r += [
             "",
-            "⚠️  Review the above. Copy a command below and run it yourself,",
-            "   or reply with the command and I will run it for you.",
+            "⚠️  Review the above. Rollback is manual — copy a command below and run",
+            "   it yourself in your terminal. This tool does not execute rollback.",
             "",
             "Full rollback (loses everything shown above):",
             "    git reset --hard HEAD && git clean -fd",

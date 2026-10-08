@@ -1,3 +1,5 @@
+<!-- HARNESS-OPTIMIZER:START -->
+
 # Global Rules (all OpenCode sessions)
 
 ## Token Protocol
@@ -22,6 +24,11 @@ Use the smallest sufficient context — not the smallest possible excerpt.
   applicable and current.
 - **Milestones**: call `git_checkpoint` at meaningful milestones, not
   after every edit.
+- **Lint scope**: `lint_file` performs Python syntax compilation
+  (`py_compile`) only. It is not a linter, type checker, or test runner.
+  For non-Python files it returns SKIPPED — use the repository's own
+  configured checks instead. Never cite a successful `lint_file` as
+  evidence that code works.
 
 ## Token Metric Reporting
 When a harness-tools call returns text containing a `[TOKEN METRIC]` line,
@@ -66,6 +73,12 @@ Instead:
 - Ask the user how to proceed
 
 ## Plan Mode
+**If an approved OpenSpec change is active for this repository** (an
+`openspec/` or `.openspec/` directory contains an approved change),
+treat that OpenSpec change as the single planning authority. Do not
+create a competing `.opencode/plan.md`. Follow the OpenSpec plan and
+its tasks. `/plan` is for work that has no OpenSpec plan.
+
 When the user types `/plan <task>`, produce a written implementation plan
 and write it to `.opencode/plan.md`, then STOP. Do not begin implementation.
 
@@ -82,5 +95,7 @@ yourself. Let the user decide whether to roll back and how.
 If you are unsure whether a recently edited MCP tool file (`server.py`)
 is loaded, tell the user to restart OpenCode. You cannot reload the MCP
 server mid-session.
+
+<!-- HARNESS-OPTIMIZER:END -->
 
 

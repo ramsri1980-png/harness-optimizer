@@ -110,11 +110,11 @@ if (FLAGS.uninstall) {
         delete cfg.mcp["harness-tools"];
         info("Removed legacy harness-tools from opencode.json");
       }
-      if (Array.isArray(cfg.plugins)) {
-        cfg.plugins = cfg.plugins.filter(p => p !== "./plugins");
-        if (cfg.plugins.length === 0) delete cfg.plugins;
-        info("Removed plugin entries from plugins array.");
-      }
+      // Note: do NOT touch cfg.plugins / the "./plugins" registration.
+      // It is a directory reference; removing it breaks any user-installed
+      // plugin that also lives under ~/.config/opencode/plugins/.
+      // We remove only the specific file we own (plugins/harness.ts) and
+      // the harness-tools MCP registration above.
       if (Array.isArray(cfg.plugin)) {
         cfg.plugin = cfg.plugin.filter(p =>
           !["opencode-runtime-fallback", "opencode-context-watch",
@@ -141,52 +141,75 @@ if (FLAGS.uninstall) {
     if (fs.existsSync(f)) { fs.rmSync(f); info(`Removed ${f}`); }
   }
 
-  // AGENTS.md: uninstall decision tree
-  //   - We created it, unchanged   → remove (or restore backup if any)
-  //   - We created it, user edited → preserve, leave backup on disk
-  //   - User-owned, we never wrote → leave alone
-  //   - Legacy marker without hash → assume we own it (backward compat)
+  // AGENTS.md uninstall — marker-aware
+  //   1. Backup exists (force-installed over user's file):
+  //        - markers + user content outside → strip section, preserve their edits + backup
+  //        - markers only                    → restore their original from backup
+  //        - no markers                      → restore their original from backup
+  //   2. Markers present → strip section, keep anything outside
+  //   3. Legacy marker, no file markers → hash check
+  //   4. Otherwise → leave file alone
   const agentsDst = path.join(CONFIG_DIR, "AGENTS.md");
   const agentsBackup = path.join(CONFIG_DIR, "AGENTS.md.harness-backup");
   const agentsMarker = path.join(CONFIG_DIR, ".harness-owns-agents");
+  const AGENTS_START_U = "<!-- HARNESS-OPTIMIZER:START -->";
+  const AGENTS_END_U = "<!-- HARNESS-OPTIMIZER:END -->";
 
-  const storedHash = readMarkerHash(agentsMarker);
-  const markerExists = fs.existsSync(agentsMarker);
-  const currentContent = fs.existsSync(agentsDst) ? fs.readFileSync(agentsDst) : null;
-  const currentHash = currentContent ? sha256(currentContent) : null;
+  const hasFile = fs.existsSync(agentsDst);
+  const hasBackup = fs.existsSync(agentsBackup);
+  const content = hasFile ? fs.readFileSync(agentsDst, "utf8") : "";
+  const hasMarkers = hasFile
+    && content.includes(AGENTS_START_U)
+    && content.includes(AGENTS_END_U);
 
-  // Legacy marker (no hash) → treat as "we own it, unknown state" → proceed with removal.
-  // New marker → only remove if the file is untouched since we wrote it.
-  const weOwnItUnchanged = markerExists && (storedHash === null || storedHash === currentHash);
-  const weOwnItButUserEdited = markerExists && storedHash !== null && storedHash !== currentHash;
+  function stripMarkedSection(text) {
+    const s = text.indexOf(AGENTS_START_U);
+    const e = text.indexOf(AGENTS_END_U) + AGENTS_END_U.length;
+    const before = text.slice(0, s).trim();
+    const after = text.slice(e).trim();
+    return [before, after].filter(Boolean).join("\n\n");
+  }
 
-  if (weOwnItUnchanged) {
-    if (fs.existsSync(agentsBackup)) {
+  if (hasBackup) {
+    if (hasMarkers) {
+      const remainder = stripMarkedSection(content);
+      if (remainder) {
+        fs.writeFileSync(agentsDst, remainder + "\n");
+        info("Removed harness section from AGENTS.md (your content preserved).");
+        info(`Your pre-install backup remains at: ${agentsBackup}`);
+      } else {
+        fs.copyFileSync(agentsBackup, agentsDst);
+        fs.rmSync(agentsBackup);
+        info("Restored your original AGENTS.md from backup.");
+      }
+    } else {
       fs.copyFileSync(agentsBackup, agentsDst);
       fs.rmSync(agentsBackup);
-      fs.rmSync(agentsMarker);
       info("Restored your original AGENTS.md from backup.");
-    } else if (fs.existsSync(agentsDst)) {
+    }
+  } else if (hasMarkers) {
+    const remainder = stripMarkedSection(content);
+    if (remainder) {
+      fs.writeFileSync(agentsDst, remainder + "\n");
+      info("Removed harness section from AGENTS.md (your content preserved).");
+    } else {
       fs.rmSync(agentsDst);
-      fs.rmSync(agentsMarker);
       info("Removed harness-created AGENTS.md.");
-    } else if (fs.existsSync(agentsMarker)) {
-      fs.rmSync(agentsMarker);
     }
-  } else if (weOwnItButUserEdited) {
-    info("AGENTS.md has been edited since install — leaving in place.");
-    if (fs.existsSync(agentsBackup)) {
-      info(`Your pre-install backup is preserved at: ${agentsBackup}`);
+  } else if (hasFile && fs.existsSync(agentsMarker)) {
+    const storedHash = readMarkerHash(agentsMarker);
+    const currentHash = sha256(content);
+    if (storedHash === null || storedHash === currentHash) {
+      fs.rmSync(agentsDst);
+      info("Removed harness-created AGENTS.md.");
+    } else {
+      info("AGENTS.md has been edited since install — leaving in place.");
     }
-    fs.rmSync(agentsMarker);
-  } else if (fs.existsSync(agentsBackup)) {
-    // No marker, but we have a backup from an earlier --force run.
-    fs.copyFileSync(agentsBackup, agentsDst);
-    fs.rmSync(agentsBackup);
-    info("Restored your original AGENTS.md from backup.");
-  } else {
+  } else if (hasFile) {
     info("AGENTS.md not owned by harness — left in place.");
   }
+
+  if (fs.existsSync(agentsMarker)) fs.rmSync(agentsMarker);
   console.log("");
   info("Uninstall complete.");
   process.exit(0);
@@ -269,35 +292,13 @@ if (fs.existsSync(CONFIG_DIR)) {
   fs.cpSync(CONFIG_DIR, BACKUP_DIR, { recursive: true });
   info(`Backed up config → ${BACKUP_DIR}`);
 }
+
 const serverTemplate = path.join(__dirname, "..", "templates", "server.py");
-fs.mkdirSync(TOOLS_DIR, { recursive: true });
-if (!FLAGS.noRuntime) {
 head("Phase: MCP Server");
+fs.mkdirSync(TOOLS_DIR, { recursive: true });
 
-const venvPy = path.join(TOOLS_DIR, "venv", "bin", "python");
-const venvPip = path.join(TOOLS_DIR, "venv", "bin", "pip");
-
-if (!fs.existsSync(venvPy)) {
-  info("Creating Python venv...");
-  execSync("python3 -m venv venv", { cwd: TOOLS_DIR, stdio: "inherit" });
-}
-info("Ensuring FastMCP is installed...");
-execSync(`${venvPip} install --quiet --upgrade pip`, { cwd: TOOLS_DIR, stdio: "inherit" });
-execSync(`${venvPip} install --quiet fastmcp`, { cwd: TOOLS_DIR, stdio: "inherit" });
-
-info("Testing server...");
-const test = spawnSync(venvPy, ["-c", `
-import asyncio
-from fastmcp import Client
-async def main():
-    async with Client('server.py') as c:
-        print(','.join(t.name for t in await c.list_tools()))
-asyncio.run(main())
-`], { cwd: TOOLS_DIR, encoding: "utf8", timeout: 30000 });
-if (test.status !== 0) fail(`Server test failed:\n${test.stderr}`);
-info(`Server OK — tools: ${test.stdout.trim()}`);
-}
-
+// Copy files first — fast, needed by both full and --no-runtime installs,
+// and required BEFORE the server test runs (the test loads server.py).
 if (!fs.existsSync(serverTemplate)) fail("templates/server.py missing from package");
 fs.copyFileSync(serverTemplate, path.join(TOOLS_DIR, "server.py"));
 info("Installed server.py");
@@ -310,6 +311,33 @@ if (fs.existsSync(uiTemplate)) {
 } else {
   warn("harness-config-ui.py template missing — config UI will not be installed.");
 }
+
+// Runtime phase: venv, pip, and the server smoke test.
+if (!FLAGS.noRuntime) {
+  const venvPy = path.join(TOOLS_DIR, "venv", "bin", "python");
+  const venvPip = path.join(TOOLS_DIR, "venv", "bin", "pip");
+
+  if (!fs.existsSync(venvPy)) {
+    info("Creating Python venv...");
+    execSync("python3 -m venv venv", { cwd: TOOLS_DIR, stdio: "inherit" });
+  }
+  info("Ensuring FastMCP is installed...");
+  execSync(`${venvPip} install --quiet --upgrade pip`, { cwd: TOOLS_DIR, stdio: "inherit" });
+  execSync(`${venvPip} install --quiet fastmcp`, { cwd: TOOLS_DIR, stdio: "inherit" });
+
+  info("Testing server...");
+  const test = spawnSync(venvPy, ["-c", `
+import asyncio
+from fastmcp import Client
+async def main():
+    async with Client('server.py') as c:
+        print(','.join(t.name for t in await c.list_tools()))
+asyncio.run(main())
+`], { cwd: TOOLS_DIR, encoding: "utf8", timeout: 30000 });
+  if (test.status !== 0) fail(`Server test failed:\n${test.stderr}`);
+  info(`Server OK — tools: ${test.stdout.trim()}`);
+}
+
 head("Phase: OpenCode Configuration");
 fs.mkdirSync(COMMANDS_DIR, { recursive: true });
 fs.mkdirSync(PLUGINS_DIR, { recursive: true });
@@ -494,30 +522,55 @@ const agentsSrc = path.join(__dirname, "..", "templates", "AGENTS.md");
 const agentsDst = path.join(CONFIG_DIR, "AGENTS.md");
 const agentsBackup = path.join(CONFIG_DIR, "AGENTS.md.harness-backup");
 const agentsMarker = path.join(CONFIG_DIR, ".harness-owns-agents");
+const AGENTS_START = "<!-- HARNESS-OPTIMIZER:START -->";
+const AGENTS_END = "<!-- HARNESS-OPTIMIZER:END -->";
+const agentsTemplate = fs.readFileSync(agentsSrc, "utf8");
+
+function writeAgentsMarker() {
+  const c = fs.readFileSync(agentsDst);
+  fs.writeFileSync(agentsMarker, JSON.stringify({
+    hash: sha256(c),
+    installedAt: new Date().toISOString(),
+  }, null, 2) + "\n");
+}
 
 if (!fs.existsSync(agentsDst)) {
   fs.copyFileSync(agentsSrc, agentsDst);
-  const content = fs.readFileSync(agentsDst);
-  fs.writeFileSync(agentsMarker, JSON.stringify({
-    hash: sha256(content),
-    installedAt: new Date().toISOString(),
-  }, null, 2) + "\n");
-  info("Installed global AGENTS.md (harness-owned).");
-} else if (FLAGS.force) {
-  if (!fs.existsSync(agentsBackup)) {
-    fs.copyFileSync(agentsDst, agentsBackup);
-    info("Backed up existing AGENTS.md → AGENTS.md.harness-backup");
-  }
-  fs.copyFileSync(agentsSrc, agentsDst);
-  const content = fs.readFileSync(agentsDst);
-  fs.writeFileSync(agentsMarker, JSON.stringify({
-    hash: sha256(content),
-    installedAt: new Date().toISOString(),
-  }, null, 2) + "\n");
-  info("Overwrote global AGENTS.md (backup saved, harness-owned).");
+  writeAgentsMarker();
+  info("Installed global AGENTS.md (harness-owned, managed section).");
 } else {
-  warn("AGENTS.md exists — preserved. Delete it and re-run to replace.");
+  const existing = fs.readFileSync(agentsDst, "utf8");
+  const hasMarkers = existing.includes(AGENTS_START) && existing.includes(AGENTS_END);
+
+  if (hasMarkers) {
+    const tStart = agentsTemplate.indexOf(AGENTS_START);
+    const tEnd = agentsTemplate.indexOf(AGENTS_END) + AGENTS_END.length;
+    const newSection = agentsTemplate.slice(tStart, tEnd);
+
+    const eStart = existing.indexOf(AGENTS_START);
+    const eEnd = existing.indexOf(AGENTS_END) + AGENTS_END.length;
+    const merged = existing.slice(0, eStart) + newSection + existing.slice(eEnd);
+
+    if (merged === existing) {
+      info("AGENTS.md managed section already up to date.");
+    } else {
+      fs.writeFileSync(agentsDst, merged);
+      info("Updated harness section in AGENTS.md (user content outside markers preserved).");
+    }
+    writeAgentsMarker();
+  } else if (FLAGS.force) {
+    if (!fs.existsSync(agentsBackup)) {
+      fs.copyFileSync(agentsDst, agentsBackup);
+      info("Backed up existing AGENTS.md → AGENTS.md.harness-backup");
+    }
+    fs.copyFileSync(agentsSrc, agentsDst);
+    writeAgentsMarker();
+    info("Overwrote global AGENTS.md (backup saved, harness-owned).");
+  } else {
+    warn("AGENTS.md exists without harness markers — preserved. Run with --force to overwrite, or wrap harness content between <!-- HARNESS-OPTIMIZER:START --> and <!-- HARNESS-OPTIMIZER:END --> for managed updates.");
+  }
 }
+
 if (!FLAGS.noRuntime) {
 head("Phase: OpenCode Plugins via npm");
 for (const pkg of ["opencode-runtime-fallback", "opencode-context-watch", "opencode-studio-server"]) {

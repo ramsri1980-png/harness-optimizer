@@ -299,6 +299,69 @@ async def test_rollback_show_staged():
         check("Staged section present", "Staged changes" in out, out[:400])
         check("a.txt appears in report", "a.txt" in out, out[:400])
 
+async def test_agents_md_markers_present():
+    print("\n[Test 17] AGENTS.md has managed markers (0.2.8 #24)")
+    with tempfile.TemporaryDirectory() as fake_home:
+        home = pathlib.Path(fake_home)
+        run_installer(home, "--no-runtime")
+        md = home / ".config" / "opencode" / "AGENTS.md"
+        text = md.read_text() if md.exists() else ""
+        check("Marker START present",
+              "<!-- HARNESS-OPTIMIZER:START -->" in text)
+        check("Marker END present",
+              "<!-- HARNESS-OPTIMIZER:END -->" in text)
+
+
+async def test_agents_md_managed_section_updates():
+    print("\n[Test 18] Template change updates managed section only (0.2.8 #24)")
+    with tempfile.TemporaryDirectory() as fake_home:
+        home = pathlib.Path(fake_home)
+        run_installer(home, "--no-runtime")
+        md = home / ".config" / "opencode" / "AGENTS.md"
+
+        # User adds content AFTER the END marker
+        with open(md, "a") as f:
+            f.write("\n# My personal addition\nKeep this.\n")
+
+        # Simulate a template change by manually editing installed file's
+        # managed section and re-running install
+        text = md.read_text()
+        modified = text.replace(
+            "# Global Rules (all OpenCode sessions)",
+            "# Global Rules (all OpenCode sessions) — SHOULD BE OVERWRITTEN"
+        )
+        md.write_text(modified)
+
+        run_installer(home, "--no-runtime")
+
+        after = md.read_text()
+        check("Managed section was updated by reinstall",
+              "SHOULD BE OVERWRITTEN" not in after)
+        check("User content after markers preserved",
+              "My personal addition" in after and "Keep this." in after)
+
+
+async def test_agents_md_uninstall_strips_only_marked():
+    print("\n[Test 19] Uninstall strips marked section only (0.2.8 #24)")
+    with tempfile.TemporaryDirectory() as fake_home:
+        home = pathlib.Path(fake_home)
+        run_installer(home, "--no-runtime")
+        md = home / ".config" / "opencode" / "AGENTS.md"
+
+        with open(md, "a") as f:
+            f.write("\n# My personal addition\nKeep this.\n")
+
+        run_installer(home, "--uninstall")
+
+        check("AGENTS.md still exists (user content present)",
+              md.exists())
+        if md.exists():
+            text = md.read_text()
+            check("Marked section removed",
+                  "HARNESS-OPTIMIZER" not in text)
+            check("User content preserved",
+                  "My personal addition" in text and "Keep this." in text)
+
 
 async def main():
     print("=" * 60)
@@ -320,6 +383,9 @@ async def main():
     await test_cumulative_limits()
     await test_installed_ui_has_v2_logic()
     await test_rollback_show_staged()
+    await test_agents_md_markers_present()
+    await test_agents_md_managed_section_updates()
+    await test_agents_md_uninstall_strips_only_marked()
 
     print("\n" + "=" * 60)
     passed = sum(1 for _, ok in results if ok)
