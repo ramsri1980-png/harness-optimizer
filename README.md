@@ -24,10 +24,10 @@ Then restart OpenCode. Ask: `List your available tools.`
 
 | Tool | Purpose | Token saving |
 |---|---|---|
-| get_repo_skeleton | AST map of Python repo (classes + signatures only) | *** |
+| get_repo_skeleton | Python symbol map with inclusive line ranges | *** |
 | rip_file_lines | Read a precise line window | *** |
 | apply_search_replace | Surgical block edit, no full rewrites | *** |
-| find_dependent_references | Find every caller of a symbol | ** |
+| find_dependent_references | Bounded Python text search (40 matches / 8,000 chars). Not semantic caller analysis. | ** |
 | lint_file | py_compile check | -- |
 | git_checkpoint | Stage + commit one file at a milestone | -- |
 | rollback_show | Read-only impact report before any reset | -- |

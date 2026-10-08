@@ -73,13 +73,34 @@ async def get_repo_skeleton(repo_path: str = ".", max_files: int = 500):
                  ".pytest_cache", "site-packages"}
 
     def symbol_span(node) -> str:
-        # Inclusive start: decorator line if decorated, else def/class line.
         start = node.lineno
         decs = getattr(node, "decorator_list", None) or []
         if decs:
             start = min(start, min(d.lineno for d in decs))
         end = getattr(node, "end_lineno", None) or start
         return f"[L{start}-L{end}]"
+
+    CONTROL_FLOW = (ast.If, ast.Try, ast.With, ast.For, ast.While,
+                    ast.AsyncWith, ast.AsyncFor)
+
+    def collect_symbols(nodes, depth=1):
+        """Return (depth, node) for every class/function, recursing into
+        bodies — including nested defs and defs inside conditional blocks.
+        Each node is visited exactly once."""
+        out = []
+        for node in nodes:
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                out.append((depth, node))
+                out.extend(collect_symbols(node.body, depth + 1))
+            elif isinstance(node, CONTROL_FLOW):
+                out.extend(collect_symbols(node.body, depth))
+                orelse = getattr(node, "orelse", None) or []
+                out.extend(collect_symbols(orelse, depth))
+                finalbody = getattr(node, "finalbody", None) or []
+                out.extend(collect_symbols(finalbody, depth))
+                for handler in getattr(node, "handlers", None) or []:
+                    out.extend(collect_symbols(handler.body, depth))
+        return out
 
     skeleton_lines = []
     total_raw_chars = 0
@@ -105,23 +126,17 @@ async def get_repo_skeleton(repo_path: str = ".", max_files: int = 500):
                 continue
 
             skeleton_lines.append(f"{rel}:")
-            for node in tree.body:
+            for depth, node in collect_symbols(tree.body, depth=1):
+                indent = "  " * depth
                 if isinstance(node, ast.ClassDef):
                     skeleton_lines.append(
-                        f"  class {node.name}: {symbol_span(node)}"
+                        f"{indent}class {node.name}: {symbol_span(node)}"
                     )
-                    for sub in node.body:
-                        if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                            args = [a.arg for a in sub.args.args]
-                            prefix = "async def" if isinstance(sub, ast.AsyncFunctionDef) else "def"
-                            skeleton_lines.append(
-                                f"    {prefix} {sub.name}({', '.join(args)}): {symbol_span(sub)}"
-                            )
-                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                else:
                     args = [a.arg for a in node.args.args]
                     prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
                     skeleton_lines.append(
-                        f"  {prefix} {node.name}({', '.join(args)}): {symbol_span(node)}"
+                        f"{indent}{prefix} {node.name}({', '.join(args)}): {symbol_span(node)}"
                     )
 
     skeleton_text = "\n".join(skeleton_lines)
@@ -173,20 +188,19 @@ async def find_dependent_references(
 ) -> str:
     """Bounded text search for a symbol in Python files.
 
-    This is a substring search, NOT proof of callers or semantic
-    dependencies. It matches any line containing the symbol text,
-    including comments and strings. Use it as a hint, not a verdict.
+    Substring search, NOT semantic dependency analysis. Matches any
+    line containing the symbol text, including comments and strings.
+    Use as a hint, not a verdict.
 
     Args:
         target_symbol: text to search for (non-empty, not whitespace-only).
         repo_path: repository root to search (must be a directory).
         max_results: cap on returned matches (default 40, min 1).
         max_chars: total response size cap in characters (default 8000,
-            min 256). Applied cumulatively to header + matches + warning.
+            min 256). Applies to header + matches + status line.
 
-    Returns matches sorted by file path then line number. If either limit
-    truncates the result, the response says so explicitly and suggests how
-    to narrow the search.
+    Reports truncation explicitly and notes unreadable files so the
+    caller knows whether the search was complete.
     """
     if not target_symbol or not target_symbol.strip():
         return "ERROR: target_symbol must be non-empty and not whitespace-only."
@@ -203,9 +217,21 @@ async def find_dependent_references(
                  "node_modules", "dist", "build", ".tox", ".mypy_cache",
                  ".pytest_cache", "site-packages"}
 
+    PER_LINE_MAX = 200
+    SYMBOL_DISPLAY_MAX = 80
+
+    def shorten_match(match: str) -> str:
+        if " \u2192 " in match:
+            loc, _, text = match.partition(" \u2192 ")
+            if len(text) > PER_LINE_MAX:
+                text = text[: PER_LINE_MAX - 3] + "..."
+            return f"{loc} \u2192 {text}"
+        return match
+
     matches: list[str] = []
     overflow_by_count = False
-    cap = max_results + 1  # collect one extra to detect truncation
+    unreadable_count = 0
+    cap = max_results + 1
 
     for dirpath, dirnames, filenames in os.walk(root_path):
         dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
@@ -226,56 +252,87 @@ async def find_dependent_references(
                                 overflow_by_count = True
                                 break
             except Exception:
+                unreadable_count += 1
                 continue
             if overflow_by_count:
                 break
         if overflow_by_count:
             break
 
-    if not matches:
-        return f"No text matches for '{target_symbol}' in the searched scope."
+    symbol_display = target_symbol
+    if len(symbol_display) > SYMBOL_DISPLAY_MAX:
+        symbol_display = symbol_display[: SYMBOL_DISPLAY_MAX - 3] + "..."
 
     truncated_by_count = overflow_by_count and len(matches) > max_results
     if truncated_by_count:
         matches = matches[:max_results]
 
+    base_status_bits: list[str] = []
+    if truncated_by_count:
+        base_status_bits.append(f"count limit {max_results} reached")
+    if unreadable_count > 0:
+        base_status_bits.append(f"{unreadable_count} file(s) unreadable; search may be incomplete")
+
+    def build_status(extra: str = "") -> str:
+        bits = base_status_bits[:]
+        if extra:
+            bits.append(extra)
+        if not bits:
+            return ""
+        return ("\n# Truncated: " + "; ".join(bits)
+                + ". Narrow the symbol or subdirectory, or increase max_results/max_chars.")
+
+    if not matches:
+        out = f"No text matches for '{symbol_display}' in the searched scope." + build_status()
+        if len(out) > max_chars:
+            out = out[: max_chars - 20] + "\n# ... clipped to max_chars"
+        return out
+
+    word = "match" if len(matches) == 1 else "matches"
     header = (
-        f"# find_dependent_references: '{target_symbol}' "
-        f"({len(matches)} match{'es' if len(matches) != 1 else ''})\n"
-        f"# Text match only \u2014 not proof of callers. Includes comments/strings."
+        f"# find_dependent_references: '{symbol_display}' "
+        f"({len(matches)} {word} shown)\n"
+        f"# Text match only \u2014 not proof of callers or semantic dependencies."
     )
 
-    STATUS_RESERVE = 220  # bytes reserved for a truncation status line
-    body_budget = max_chars - len(header) - STATUS_RESERVE - 2
+    matches = [shorten_match(m) for m in matches]
 
-    body: list[str] = []
+    # Reserve for status line; scale down for small budgets.
+    probe = build_status("char limit 999999 reached (99999 more match(es) omitted)")
+    if max_chars >= 1000:
+        status_reserve = len(probe)
+    elif max_chars >= 500:
+        status_reserve = min(len(probe), 150)
+    else:
+        status_reserve = 0  # too tight; skip status and rely on header count
+
+    body_budget = max_chars - len(header) - status_reserve - 1
+    if body_budget < 40 and matches:
+        # Fallback: minimal header, drop the second descriptive line.
+        header = (f"# find_dependent_references: '{symbol_display}' "
+                  f"({len(matches)} {word})")
+        body_budget = max_chars - len(header) - status_reserve - 1
+
+    body_lines: list[str] = []
     body_used = 0
-    for line in matches:
-        projected = body_used + len(line) + 1
-        if projected > body_budget:
+    skipped = 0
+    for i, match in enumerate(matches):
+        sep = 1 if body_lines else 0
+        if body_used + sep + len(match) <= body_budget:
+            body_lines.append(match)
+            body_used += sep + len(match)
+        else:
+            skipped = len(matches) - i
             break
-        body.append(line)
-        body_used = projected
 
-    char_truncated = len(body) < len(matches)
+    extra = ""
+    if skipped > 0:
+        extra = f"char limit {max_chars} reached ({skipped} more match(es) omitted)"
 
-    status_parts = []
-    if truncated_by_count:
-        status_parts.append(f"count limit {max_results} reached")
-    if char_truncated:
-        status_parts.append(f"char limit {max_chars} reached")
-
-    out_lines = [header] + body
-    if status_parts:
-        out_lines.append(
-            f"# Truncated: {'; '.join(status_parts)}. "
-            f"Narrow the symbol or subdirectory, or increase max_results/max_chars."
-        )
-
-    response = "\n".join(out_lines)
-    if len(response) > max_chars:
-        response = response[: max_chars - 40] + "\n# ... hard-clipped to max_chars"
-    return response
+    out = header + "\n" + "\n".join(body_lines) + build_status(extra)
+    if len(out) > max_chars:
+        out = out[: max_chars - 20] + "\n# ... hard-clipped to max_chars"
+    return out
 
 
 # ═══════════════════════════════════════════════════════════

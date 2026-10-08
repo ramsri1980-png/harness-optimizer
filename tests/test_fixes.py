@@ -467,21 +467,43 @@ async def test_managed_section_update_still_works():
         check("User content outside markers preserved",
               "Personal section" in after and "Keep this forever." in after)
 async def test_skeleton_includes_line_ranges():
-    print("\n[Test 24] Skeleton includes line ranges (0.3.0 #1)")
+    print("\n[Test 24] Skeleton line ranges + recursion (0.3.1)")
     with tempfile.TemporaryDirectory() as d:
         with open(os.path.join(d, "sample.py"), "w") as f:
             f.write(
-                "def top():\n    return 1\n\n"
-                "async def async_top():\n    return 2\n\n"
-                "class Foo:\n"
-                "    def method(self):\n        pass\n"
-                "    async def async_method(self):\n        pass\n"
+                "@decorator\n"
+                "def decorated():\n"          # L2-L3
+                "    pass\n"
+                "\n"
+                "def outer():\n"               # L6-L11
+                "    def nested():\n"          # L7-L8
+                "        return 1\n"
+                "    return nested\n"
+                "\n"
+                "if True:\n"                   # L11
+                "    def conditional_fn():\n"  # L12-L13
+                "        pass\n"
+                "\n"
+                "class Foo:\n"                 # L15-L19
+                "    def method(self):\n"      # L16-L17
+                "        pass\n"
+                "    async def async_method(self):\n"  # L18-L19
+                "        pass\n"
             )
         out = await server.get_repo_skeleton(repo_path=d)
-        check("Line range present for top()", "[L1-L2]" in out, out[:400])
-        check("Class has range", "class Foo" in out and "[L" in out, out[:400])
-        check("Async prefix used", "async def" in out, out[:400])
-        check("Method has its own range", out.count("[L") >= 4, out[:400])
+
+        check("Decorated function has range",
+              "decorated" in out and "[L1-L3]" in out, out[:500])
+        check("Nested function present",
+              "nested" in out, out[:500])
+        check("Conditional-def present",
+              "conditional_fn" in out, out[:500])
+        check("Class has range",
+              "class Foo" in out and "[L14-L18]" in out, out[:500])
+        check("Method has own range (not class range)",
+              "method" in out and "[L15-L16]" in out, out[:600])
+        check("Async prefix on method",
+              "async def async_method" in out, out[:500])
 
 async def test_find_refs_rejects_empty():
     print("\n[Test 25] find_dependent_references rejects empty (0.3.0 #2)")
@@ -490,30 +512,79 @@ async def test_find_refs_rejects_empty():
         r2 = await server.find_dependent_references("   ", d)
         check("Empty symbol rejected", r1.startswith("ERROR:"), r1)
         check("Whitespace symbol rejected", r2.startswith("ERROR:"), r2)
+
 async def test_find_refs_enforces_limits():
-    print("\n[Test 26] find_dependent_references enforces limits (0.3.0 #2)")
+    print("\n[Test 26] find_dependent_references limits + visibility (0.3.1)")
     with tempfile.TemporaryDirectory() as d:
-        for i in range(60):
-            with open(os.path.join(d, f"f{i:02d}.py"), "w") as f:
-                f.write("findme_token = 1\n" * 3)
-        r = await server.find_dependent_references(
-            "findme_token", d, max_results=5, max_chars=8000)
-        check("Count limit reported", "count limit 5" in r, r[:300])
-        r = await server.find_dependent_references(
-            "findme_token", d, max_results=500, max_chars=300)
-        check("Char budget enforced", len(r) <= 300, f"got {len(r)}")
-        r = await server.find_dependent_references("x", d, max_results=0)
-        check("max_results=0 rejected", r.startswith("ERROR:"), r)
-        r = await server.find_dependent_references("x", d, max_chars=100)
-        check("max_chars=100 rejected", r.startswith("ERROR:"), r)
+        # One huge line, then a short match
+        with open(os.path.join(d, "a.py"), "w") as f:
+            f.write('target = "' + "x" * 15000 + '"\n')
+            f.write("target = short\n")
+
+        r = await server.find_dependent_references("target", d)
+        check("Huge first line still shows location", "a.py:1" in r, r[:300])
+        check("Short second match visible", "a.py:2" in r, r[:300])
+        check("Default budget respected", len(r) <= 8000, f"{len(r)} chars")
+
+        # Small budget — one short match must remain visible
+        with tempfile.TemporaryDirectory() as d2:
+            with open(os.path.join(d2, "b.py"), "w") as f:
+                f.write("target = 1\n")
+            r = await server.find_dependent_references("target", d2, max_chars=300)
+            check("Small budget respected", len(r) <= 300, f"{len(r)} chars")
+            check("Location visible in small budget", "b.py:1" in r, r[:200])
+
+        # Count limit
+        with tempfile.TemporaryDirectory() as d3:
+            for i in range(60):
+                with open(os.path.join(d3, f"f{i:02d}.py"), "w") as f:
+                    f.write("findme_token = 1\n" * 3)
+            r = await server.find_dependent_references(
+                "findme_token", d3, max_results=5, max_chars=8000)
+            check("Count limit reported", "count limit 5" in r, r[:300])
+
+        # Input validation
+        with tempfile.TemporaryDirectory() as d4:
+            r = await server.find_dependent_references("", d4)
+            check("Empty symbol rejected", r.startswith("ERROR:"), r)
+            r = await server.find_dependent_references("   ", d4)
+            check("Whitespace symbol rejected", r.startswith("ERROR:"), r)
+            r = await server.find_dependent_references("x", "/definitely_not_a_dir_xyz")
+            check("Invalid dir rejected", r.startswith("ERROR:"), r)
+            r = await server.find_dependent_references("x", d4, max_results=0)
+            check("max_results=0 rejected", r.startswith("ERROR:"), r)
+            r = await server.find_dependent_references("x", d4, max_chars=100)
+            check("max_chars=100 rejected", r.startswith("ERROR:"), r)
+
 
 async def test_find_refs_no_matches():
-    print("\n[Test 27] find_dependent_references no-match message (0.3.0 #2)")
+    print("\n[Test 27] find_dependent_references no-match + safety (0.3.1)")
     with tempfile.TemporaryDirectory() as d:
         with open(os.path.join(d, "one.py"), "w") as f:
             f.write("a = 1\n")
+
+        # Short symbol, no matches
         r = await server.find_dependent_references("never_here_xyz", d)
         check("No-match message present", "No text matches" in r, r[:200])
+
+        # Huge symbol string with no matches — must respect max_chars
+        huge = "y" * 9000
+        r = await server.find_dependent_references(huge, d)
+        check("Huge symbol capped under 8000", len(r) <= 8000, f"{len(r)} chars")
+        check("No-match message still present", "No text matches" in r, r[:200])
+
+        # Unreadable file — must report incomplete
+        target = os.path.join(d, "unreadable.py")
+        with open(target, "w") as f:
+            f.write("target_token = 1\n")
+        os.chmod(target, 0o000)
+        try:
+            r = await server.find_dependent_references("target_token", d)
+            check("Unreadable file reported",
+                  "unreadable" in r.lower() or "incomplete" in r.lower(),
+                  r[:300])
+        finally:
+            os.chmod(target, 0o644)
 
 
 async def main():
