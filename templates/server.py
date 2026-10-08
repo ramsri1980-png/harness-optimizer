@@ -422,19 +422,95 @@ async def lint_file(file_path: str) -> str:
     if not os.path.exists(path):
         return f"FAIL: file not found — {path}"
 
+    cwd = os.path.dirname(os.path.abspath(path))
+    cmd = ["python3", "-m", "py_compile", path]
+
     try:
         res = subprocess.run(
-            ["python3", "-m", "py_compile", path],
+            cmd,
             capture_output=True, text=True, shell=False,
+            timeout=10,
         )
+    except subprocess.TimeoutExpired:
+        return f"FAIL: py_compile timed out after 10s — {os.path.basename(path)}"
     except FileNotFoundError:
-        return "FAIL: python3 not available on PATH; cannot run py_compile."
+        return "FAIL: python3 not available on PATH"
 
-    if res.returncode != 0:
-        detail = (res.stderr or "").strip() or "(no stderr)"
-        return f"FAIL: Python syntax error — {os.path.basename(path)}\n{detail}"
+    # Build execution header only for non-OK results
+    if res.returncode == 0:
+        return f"OK: Python syntax check passed — {os.path.basename(path)}"
 
-    return f"OK: Python syntax check passed — {os.path.basename(path)}"
+    # Build execution header for FAIL responses
+    header = (
+        f"lint_file: python3 -m py_compile\n"
+        f"  file dir: {cwd}\n"
+        f"  exit: {res.returncode}\n"
+    )
+
+    # Parse stderr for location info
+    stderr = (res.stderr or "").strip()
+    location_line = None
+
+    # Pattern 1: file:line: message (requires .py path)
+    # Pattern 2: py_compile "File ".../x.py", line N
+    # Pattern 3: fallback ", line N"
+    for line in stderr.splitlines():
+        m = re.search(r'^(.+?\.py):(\d+):', line)
+        if not m:
+            m = re.search(r'^File\s+"([^"]+\.py)",\s*line\s+(\d+)', line)
+        if not m:
+            m = re.search(r',\s*line\s+(\d+)', line)
+        if m:
+            location_line = int(m.groups()[-1])
+            break
+
+    # Build diagnostic output
+    if location_line:
+        # Read source file and extract context around error line
+        try:
+            with open(path, 'r') as f:
+                lines = f.readlines()
+        except (OSError, UnicodeDecodeError) as e:
+            lines = []
+            read_error = str(e)
+
+        if lines:
+            # Get up to 5 lines total centered on error line (1-indexed)
+            err_idx = location_line - 1
+            start = max(0, err_idx - 2)
+            end = min(len(lines), err_idx + 3)
+            context_lines = lines[start:end]
+
+            diagnostic = f"  {os.path.basename(path)}:{location_line}\n"
+            for i, src_line in enumerate(context_lines):
+                actual_line = start + i + 1
+                prefix = "→ " if actual_line == location_line else "  "
+                diagnostic += f"    {prefix}{actual_line}: {src_line.rstrip()}\n"
+        else:
+            if 'read_error' in locals():
+                diagnostic = f"  {os.path.basename(path)}:{location_line}\n    (source unavailable: {read_error})\n"
+            else:
+                diagnostic = f"  {os.path.basename(path)}:{location_line}\n    (source unavailable)\n"
+    else:
+        # No location parsed - return raw stderr (capped)
+        raw = stderr or "(no stderr)"
+        if len(raw) > 4000:
+            suffix = "\n... [truncated] ...\n"
+            budget = 4000 - len(suffix)
+            half = budget // 2
+            raw = raw[:half] + suffix + raw[-half:]
+        diagnostic = f"  {raw}\n  (no location parsed)\n"
+
+    result = f"{header}FAIL: Python syntax error — {os.path.basename(path)}\n{diagnostic}"
+
+    # Cap total output at 4000 chars
+    if len(result) > 4000:
+        suffix = "\n... [truncated] ...\n"
+        budget = 4000 - len(suffix)
+        half = budget // 2
+        result = result[:half] + suffix + result[-half:]
+
+    return result
 
 @register("git_checkpoint")
 async def git_checkpoint(file_path: str, change_summary: str):

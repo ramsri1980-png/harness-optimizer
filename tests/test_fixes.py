@@ -777,6 +777,11 @@ async def main():
     await test_legacy_commands_preserved_with_warning()
     await test_command_manifest_blocks_overwrite_of_user_file()
     await test_command_manifest_preserves_edits_on_uninstall()
+    await test_lint_diagnostic_context()
+    await test_lint_timeout_and_interpreter_error()
+    await test_lint_unrecognized_diagnostic()
+    await test_lint_line_5_context()
+    await test_lint_truncation_cap()
 
 
     print("\n" + "=" * 60)
@@ -790,6 +795,105 @@ async def main():
             if not ok:
                 print(f"  ✗ {name}")
         sys.exit(1)
+
+
+async def test_lint_diagnostic_context():
+    print("\n[Test LINT-02] lint_file diagnostic source context (T05)")
+    with tempfile.TemporaryDirectory() as d:
+        bad = os.path.join(d, "bad.py")
+        with open(bad, "w") as f:
+            f.write("def foo(:\n    pass\n")
+        r = await server.lint_file(bad)
+        check("Response includes filename", "bad.py" in r, r[:300])
+        check("Response includes error line number",
+              ":1" in r or "line 1" in r, r[:300])
+        check("Response marks error line with arrow", "→" in r, r[:300])
+        check("Response is bounded", len(r) <= 4000, f"len={len(r)}")
+        check("Excludes '(source unavailable)' when source is read",
+              "(source unavailable" not in r, r[:300])
+        excerpt_lines = [ln for ln in r.split("\n")
+                         if ln.strip() and (ln.startswith("    ") or ln.lstrip().startswith("→"))]
+        check("Excerpt ≤ 5 lines", len(excerpt_lines) <= 5, f"got {len(excerpt_lines)}")
+
+
+async def test_lint_timeout_and_interpreter_error():
+    print("\n[Test LINT-03] lint_file timeout + interpreter error (T05)")
+    from unittest.mock import patch
+    import subprocess as sp
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "a.py")
+        with open(f, "w") as fh:
+            fh.write("pass\n")
+        with patch("server.subprocess.run", side_effect=sp.TimeoutExpired("python3", 10)):
+            r = await server.lint_file(f)
+        check("Timeout returns FAIL", "FAIL:" in r, r[:200])
+        check("Timeout message mentions timeout",
+              "timed out" in r.lower() or "timeout" in r.lower(), r[:200])
+        with patch("server.subprocess.run", side_effect=FileNotFoundError("python3")):
+            r = await server.lint_file(f)
+        check("Missing python3 returns FAIL", "FAIL:" in r, r[:200])
+        check("Missing python3 message mentions not available",
+              "not available" in r.lower(), r[:200])
+
+
+async def test_lint_unrecognized_diagnostic():
+    print("\n[Test LINT-06] lint_file unrecognized diagnostic (T05)")
+    from unittest.mock import patch
+    from subprocess import CompletedProcess
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "a.py")
+        with open(f, "w") as fh:
+            fh.write("pass\n")
+        fake = CompletedProcess(
+            args=["python3", "-m", "py_compile", f],
+            returncode=1, stdout="", stderr="compilation failed for reasons unknown\n",
+        )
+        with patch("server.subprocess.run", return_value=fake):
+            r = await server.lint_file(f)
+        check("Unrecognized diagnostic returns FAIL", "FAIL:" in r, r[:300])
+        check("Raw stderr preserved",
+              "compilation failed for reasons unknown" in r, r[:300])
+        check("No fabricated line number",
+              "line 999" not in r.lower() and ":999" not in r, r[:300])
+        check("Includes '(no location parsed)' marker",
+              "(no location parsed)" in r, r[:400])
+
+
+async def test_lint_line_5_context():
+    print("\n[Test LINT-07] lint_file line 5 context")
+    with tempfile.TemporaryDirectory() as d:
+        bad = os.path.join(d, "line5.py")
+        with open(bad, "w") as f:
+            f.write("x = 1\n")
+            f.write("y = 2\n")
+            f.write("z = 3\n")
+            f.write("w = 4\n")
+            f.write("def foo(:\n")
+            f.write("    pass\n")
+        r = await server.lint_file(bad)
+        check("→ appears in excerpt", "→" in r, r[:300])
+        check("Line 5 in excerpt", ":5" in r, r[:300])
+        check("Response ≤ 4000 chars", len(r) <= 4000, f"len={len(r)}")
+
+
+async def test_lint_truncation_cap():
+    print("\n[Test LINT-08] lint_file truncation cap")
+    from unittest.mock import patch
+    import subprocess as sp
+    with tempfile.TemporaryDirectory() as d:
+        bad = os.path.join(d, "big.py")
+        with open(bad, "w") as f:
+            f.write("line1\nline2\nline3\nline4\n")
+            f.write("x" * 5000 + "\n")
+            f.write("line6\n")
+        fake = sp.CompletedProcess(
+            args=["python3", "-m", "py_compile", bad],
+            returncode=1, stdout="", stderr="big.py:5: " + "x" * 6000,
+        )
+        with patch("server.subprocess.run", return_value=fake):
+            r = await server.lint_file(bad)
+        check("Truncated output contains marker", "\n... [truncated] ...\n" in r, r[:500])
+        check("Total length ≤ 4000", len(r) <= 4000, f"len={len(r)}")
 
 
 if __name__ == "__main__":
