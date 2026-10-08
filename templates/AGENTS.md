@@ -153,6 +153,39 @@ If you are unsure whether a recently edited MCP tool file (`server.py`)
 is loaded, tell the user to restart OpenCode. You cannot reload the MCP
 server mid-session.
 
+
+
+## Preserve User Configuration
+
+Never delete, overwrite, or "reset" the user's existing configuration
+in `~/.config/opencode/opencode.json`. This file contains user-owned
+settings that may not exist in this repo, including custom providers
+(e.g., TokenHarbor), custom agents, model fallback chains, unrelated
+MCP servers, and unrelated plugin entries.
+
+### Rules
+
+1. **Load, then merge.** Always read the existing config first, then
+   add or update only the keys this repo owns. Never start from `{}`.
+2. **Never remove what you didn't add.** If a provider, agent, plugin,
+   or MCP server isn't part of this project's declared scope, leave it
+   alone.
+3. **Never overwrite a whole config object.** Update individual keys.
+4. **`--force` means force-overwrite the files this repo manages**
+   (commands, AGENTS.md), **not** reset opencode.json.
+5. **Backup first.** Before any write to `opencode.json`, copy the
+   current file to `opencode.json.bak.<timestamp>`.
+6. **If unsure, ask.** If a change would require deleting an unknown
+   key, stop and ask the user.
+
+### Acceptance test after any config change
+
+- `tokenharbor` (or any custom provider) is still present
+- The user's agents list is unchanged
+- The user's plugins list is unchanged
+- `git diff` shows only keys this repo owns
+
+
 <!-- HARNESS-OPTIMIZER:END -->
 
 
