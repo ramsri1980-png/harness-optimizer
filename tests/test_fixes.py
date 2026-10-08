@@ -894,6 +894,141 @@ async def test_read_truncation_budget_use():
         check("Response <= 4000", len(r) <= 4000, f"len={len(r)}")
 
 
+async def test_edit_strict_rejections_do_not_write():
+    print("\n[Test EDIT-01] apply_search_replace strict refusals (T04)")
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "sample.py")
+        original = "def a():\n    return 1\n"
+        with open(f, "w") as fh:
+            fh.write(original)
+        before = open(f, "rb").read()
+
+        r = await server.apply_search_replace(f, "", "x")
+        check("Empty search rejected", "ERROR" in r.upper(), r[:200])
+        r = await server.apply_search_replace(f, "   ", "x")
+        check("Whitespace search rejected", "ERROR" in r.upper(), r[:200])
+        r = await server.apply_search_replace(f, "does_not_exist_xyz", "x")
+        check("No-match rejected", "ERROR" in r.upper(), r[:200])
+        with open(f, "w") as fh:
+            fh.write("x = 1\nx = 1\n")
+        r = await server.apply_search_replace(f, "x = 1", "y = 2")
+        check("Ambiguous match rejected", "ERROR" in r.upper(), r[:200])
+        check("Ambiguous file unchanged",
+              open(f, "rb").read() == b"x = 1\nx = 1\n",
+              open(f).read()[:200])
+
+        with open(f, "wb") as fh:
+            fh.write(before)
+        check("Refusals did not write", open(f, "rb").read() == before)
+
+
+async def test_edit_expected_hash_stale():
+    print("\n[Test EDIT-02] apply_search_replace stale hash (T04)")
+    import hashlib
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "sample.py")
+        original = "def a():\n    return 1\n"
+        with open(f, "w") as fh:
+            fh.write(original)
+        h_old = hashlib.sha256(original.encode()).hexdigest()
+
+        modified = original.replace("return 1", "return 2")
+        with open(f, "w") as fh:
+            fh.write(modified)
+
+        r = await server.apply_search_replace(
+            f, "def a", "def b", expected_sha256=h_old)
+        check("Stale hash refused", "stale" in r.lower(), r[:300])
+        check("Original file intact after stale refusal",
+              open(f).read() == modified, open(f).read()[:200])
+
+        h_new = hashlib.sha256(modified.encode()).hexdigest()
+        r2 = await server.apply_search_replace(
+            f, "def a", "def b", expected_sha256=h_new)
+        check("Correct hash allows edit",
+              "successfully" in r2.lower() or "Surgical" in r2, r2[:300])
+        check("Edit applied",
+              open(f).read().startswith("def b"), open(f).read()[:200])
+
+
+async def test_edit_preserves_mode_and_newlines():
+    print("\n[Test EDIT-03] apply_search_replace preserves mode/newlines (T04)")
+    import stat as stat_mod
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "sample.py")
+        with open(f, "wb") as fh:
+            fh.write(b"def a():\r\n    x = 1    \r\n    return x\r\n")
+        try:
+            os.chmod(f, 0o755)
+        except OSError:
+            pass
+        mode_before = stat_mod.S_IMODE(os.stat(f).st_mode)
+
+        r = await server.apply_search_replace(f, "    x = 1", "    x = 99")
+        check("Edit success reported",
+              "successfully" in r.lower() or "Surgical" in r, r[:300])
+
+        after = open(f, "rb").read()
+        check("CRLF preserved in output", b"\r\n" in after, str(after[:200]))
+        check("Trailing whitespace on other lines preserved",
+              b"    return x\r\n" in after, str(after[:200]))
+        mode_after = stat_mod.S_IMODE(os.stat(f).st_mode)
+        check("Mode preserved (0o755)",
+              mode_before == mode_after,
+              f"{oct(mode_before)} -> {oct(mode_after)}")
+
+
+async def test_edit_atomic_failure_cleanup():
+    print("\n[Test EDIT-04] apply_search_replace atomic failure (T04)")
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "sample.py")
+        original = "def a():\n    return 1\n"
+        with open(f, "w") as fh:
+            fh.write(original)
+        with patch("server.os.replace", side_effect=OSError("simulated")):
+            r = await server.apply_search_replace(f, "return 1", "return 2")
+        check("Failure reported", "ERROR" in r.upper() or "fail" in r.lower(),
+              r[:300])
+        check("Original file intact", open(f).read() == original,
+              open(f).read()[:200])
+        leftovers = [n for n in os.listdir(d) if n != "sample.py"]
+        check("No temp file leaked", leftovers == [], str(leftovers))
+
+
+async def test_edit_path_handling():
+    print("\n[Test EDIT-05] apply_search_replace path handling (T04)")
+    # NOTE: full permission/symlink integration is BLOCKED pending
+    # the shared workspace module (CORE workstream). This test covers
+    # only what is possible with the current file-API.
+    with tempfile.TemporaryDirectory() as d:
+        r = await server.apply_search_replace(
+            os.path.join(d, "nope.py"), "x", "y")
+        check("Missing file rejected",
+              "ERROR" in r.upper() or "not found" in r.lower(), r[:200])
+        sub = os.path.join(d, "sub")
+        os.makedirs(sub)
+        r = await server.apply_search_replace(sub, "x", "y")
+        check("Directory rejected",
+              "ERROR" in r.upper() or "directory" in r.lower(), r[:200])
+
+
+async def test_edit_no_op_detection():
+    print("\n[Test EDIT-06] apply_search_replace no-op detection (T04)")
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "sample.py")
+        original = "def a():\n    return 1\n"
+        with open(f, "w") as fh:
+            fh.write(original)
+        mtime_before = os.stat(f).st_mtime_ns
+        r = await server.apply_search_replace(f, "return 1", "return 1")
+        check("No-op reported as no change",
+              "no change" in r.lower(), r[:300])
+        check("File not touched", open(f).read() == original)
+        check("mtime unchanged",
+              os.stat(f).st_mtime_ns == mtime_before)
+
+
 async def main():
     print("=" * 60)
     print("Harness-Optimizer Fix Verification")
@@ -949,6 +1084,12 @@ async def main():
     await test_read_huge_line_useful_failure()
     await test_read_enclosing_innermost()
     await test_read_truncation_budget_use()
+    await test_edit_strict_rejections_do_not_write()
+    await test_edit_expected_hash_stale()
+    await test_edit_preserves_mode_and_newlines()
+    await test_edit_atomic_failure_cleanup()
+    await test_edit_path_handling()
+    await test_edit_no_op_detection()
 
 
     print("\n" + "=" * 60)

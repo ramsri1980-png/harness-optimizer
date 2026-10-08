@@ -14,6 +14,8 @@ import re
 import shlex
 import sqlite3
 import subprocess
+import sys
+import tempfile
 
 from fastmcp import Context, FastMCP
 
@@ -523,33 +525,194 @@ async def find_dependent_references(
 # B. Surgical code modification
 # ═══════════════════════════════════════════════════════════
 
+# T04 tuning constants for apply_search_replace
+_EDIT_MAX_CHARS = 4000        # hard response cap
+_EDIT_MAX_DIFF_LINES = 20     # combined -/+ lines kept in the diff
+
+
+def _detect_newline(text: str) -> str:
+    """Dominant newline of a text: CRLF when it accounts for at least
+    half of all newline characters, else LF."""
+    crlf = text.count("\r\n")
+    if crlf and crlf >= text.count("\n") / 2:
+        return "\r\n"
+    return "\n"
+
+
+def _normalize_newlines(text: str, newline: str) -> str:
+    """Rewrite every line break to `newline`."""
+    if newline == "\n":
+        return text.replace("\r\n", "\n")
+    return text.replace("\r\n", "\n").replace("\n", "\r\n")
+
+
+def _trim_middle(lines, budget, marker="    ... [truncated] ..."):
+    """Join `lines` to at most `budget` chars, dropping from the middle
+    and leaving `marker` in its place."""
+    text = "\n".join(lines)
+    if len(text) <= budget:
+        return text
+    room = budget - len(marker) - 1
+    if room <= 0:
+        return marker[:budget]
+    half = room // 2
+    head, used = [], 0
+    for ln in lines:
+        if used + len(ln) + 1 > half:
+            break
+        head.append(ln)
+        used += len(ln) + 1
+    tail, used2 = [], 0
+    for ln in reversed(lines):
+        if used2 + len(ln) + 1 > room - used:
+            break
+        tail.append(ln)
+        used2 += len(ln) + 1
+    tail.reverse()
+    out = "\n".join(head + [marker] + tail)
+    return out[:budget] if len(out) > budget else out
+
+
 @register("apply_search_replace")
-async def apply_search_replace(file_path: str, search_block: str, replace_block: str):
+async def apply_search_replace(file_path: str, search_block: str, replace_block: str,
+                               expected_sha256: str = None) -> str:
+    """Replace the exact `search_block` with `replace_block` once.
+
+    Matching is a strict, case-sensitive substring match against the
+    file text (newline-normalized). Zero matches or more than one
+    match are errors - callers must add context to disambiguate.
+
+    expected_sha256 (optional) is a stale-content guard: when given,
+    the file's current sha256 must match or the edit is refused and
+    nothing is written.
+
+    The file's dominant newline convention and POSIX mode are
+    preserved, and the write is atomic (temp file in the same
+    directory + os.replace)."""
     path = os.path.expanduser(file_path)
     if not os.path.exists(path):
         return f"ERROR: File not found: {path}"
-        
+    if os.path.isdir(path):
+        return f"ERROR: {path} is a directory, not a file"
     if not search_block.strip():
         return "ERROR: Search block cannot be empty or whitespace only."
-        
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
-        
-    count = content.count(search_block)
+
+    basename = os.path.basename(path)
+    try:
+        with open(path, "rb") as f:
+            raw_before = f.read()
+    except OSError as exc:
+        return f"ERROR: read failed - {basename}: {exc}"
+
+    before_sha = hashlib.sha256(raw_before).hexdigest()
+
+    # Optional stale-content guard. Refuse rather than write anyway.
+    if expected_sha256 is not None and before_sha != expected_sha256:
+        return (
+            f"ERROR: stale content - expected {expected_sha256[:12]}, "
+            f"found {before_sha[:12]}\n"
+            f"current_sha256: {before_sha}"
+        )
+
+    text = raw_before.decode("utf-8", errors="surrogateescape")
+    newline = _detect_newline(text)
+
+    # Match on LF-normalized text so callers pass conventional \n
+    # blocks regardless of the file's own convention.
+    norm_text = text.replace("\r\n", "\n")
+    norm_search = search_block.replace("\r\n", "\n")
+    norm_replace = replace_block.replace("\r\n", "\n")
+
+    count = norm_text.count(norm_search)
     if count == 0:
         return f"ERROR: TARGET SEARCH BLOCK NOT FOUND EXACTLY in {path}"
     if count > 1:
-        return f"ERROR: Search block matches {count} locations. Please provide more context to make it unique."
-        
-    new_content = content.replace(search_block, replace_block, 1)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(new_content)
-        
-    full_rewrite = estimate_tokens(new_content)
+        return (f"ERROR: Search block matches {count} locations. "
+                f"Please provide more context to make it unique.")
+
+    pos = norm_text.find(norm_search)
+    start_line = norm_text[:pos].count("\n") + 1
+    end_line = start_line + norm_search.count("\n")
+
+    new_norm = norm_text.replace(norm_search, norm_replace, 1)
+    new_text = _normalize_newlines(new_norm, newline)
+    raw_after = new_text.encode("utf-8", errors="surrogateescape")
+    after_sha = hashlib.sha256(raw_after).hexdigest()
+
+    # No-op guard: identical bytes means nothing to write.
+    if raw_after == raw_before:
+        return (
+            "No change: replacement is identical to original.\n"
+            f"before_sha256: {before_sha}\n"
+            f"after_sha256:  {after_sha}"
+        )
+
+    # Compact unified-ish diff: the replaced lines vs the new lines.
+    removed = [f"    - {ln}" for ln in norm_search.split("\n")]
+    added = [f"    + {ln}" for ln in norm_replace.split("\n")]
+    diff_lines = removed + added
+    if len(diff_lines) > _EDIT_MAX_DIFF_LINES:
+        # Keep at most _EDIT_MAX_DIFF_LINES combined -/+ lines.
+        keep_head = (_EDIT_MAX_DIFF_LINES - 1) // 2
+        keep_tail = _EDIT_MAX_DIFF_LINES - 1 - keep_head
+        diff_lines = (diff_lines[:keep_head]
+                      + ["    ... [truncated] ..."]
+                      + diff_lines[-keep_tail:])
+
+    # Build the response, reserving room for everything but the diff so
+    # before/after sha256 and changed_range always survive intact.
+    full_rewrite = estimate_tokens(new_text)
     patch = estimate_tokens(search_block + replace_block)
     saved = max(0, full_rewrite - patch)
-    metric = f"[TOKEN METRIC] tool=apply_search_replace saved={saved} baseline={full_rewrite} actual={patch} type=payload_reduction"
-    return "Surgical replacement applied successfully.\n\n" + metric
+    metric = (f"[TOKEN METRIC] tool=apply_search_replace saved={saved:,} "
+              f"baseline={full_rewrite:,} actual={patch:,} type=payload_reduction")
+
+    head = (
+        "Surgical replacement applied successfully.\n"
+        f"before_sha256: {before_sha}\n"
+        f"after_sha256:  {after_sha}\n"
+        f"changed_range: lines {start_line}-{end_line}\n"
+        "diff:"
+    )
+    tail = "\n\n" + metric
+    diff_budget = _EDIT_MAX_CHARS - len(head) - len(tail)
+    diff_text = _trim_middle(diff_lines, diff_budget)
+    response = head + "\n" + diff_text + tail
+
+    # Last-resort guard; the budget above should already fit.
+    if len(response) > _EDIT_MAX_CHARS:
+        response = response[:_EDIT_MAX_CHARS]
+
+    # Atomic write: temp file in the same directory, then os.replace.
+    target_dir = os.path.dirname(os.path.abspath(path)) or "."
+    is_win = sys.platform.startswith("win")
+    mode_before = None
+    if not is_win:
+        try:
+            mode_before = os.stat(path).st_mode
+        except OSError:
+            mode_before = None
+
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=target_dir, prefix=".asr-", suffix=".tmp")
+        with os.fdopen(fd, "wb") as tf:
+            tf.write(raw_after)
+            tf.flush()
+            os.fsync(tf.fileno())
+        if mode_before is not None:
+            os.chmod(tmp_path, mode_before)
+        os.replace(tmp_path, path)
+        tmp_path = None
+    except Exception as exc:
+        if tmp_path is not None and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        return f"ERROR: write failed - {basename}: {exc}"
+
+    return response
 
 # ═══════════════════════════════════════════════════════════
 # C. Safety and version control
