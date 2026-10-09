@@ -15,39 +15,103 @@ Use the smallest sufficient context — not the smallest possible excerpt.
 - **Editing**: prefer `apply_search_replace` for surgical block edits.
   Use OpenCode's native `edit` tool when it provides equivalent safety
   with less work. Never rewrite a full file to make a small change.
-- **Tool selection**: use the smallest sufficient tool. Prefer harness
-  tools when the task pattern matches:
-  - Reading a specific line range of a large file → `rip_file_lines`
-  - Understanding structure without full contents → `get_repo_skeleton`
-  - Finding where a symbol is used → `find_dependent_references`
-  - Surgical block edit with unique context → `apply_search_replace`
-  Use native tools when:
-  - The file is small (full read is cheap)
-  - You need the whole file to reason
-  - You're exploring without a specific target
-  For `get_repo_skeleton` specifically: prefer mode="ranked" for
-  repository-wide exploration when the relevant files are not yet known.
-  Prefer mode="outline" (or a direct read) when the task points at a
-  specific file.
-  Never force a harness tool merely to produce a savings metric, and never
-  bypass a refused operation or permission restriction.
+- **Evidence**: do not claim to have inspected code, edited files, or
+  executed checks without actual tool evidence in this session.
+- **No redundancy**: do not repeat a read, search, or check whose result
+  is already current in context. Reuse current evidence; retrieve only
+  what is genuinely missing or stale.
 - **Verification**: run language-appropriate checks and relevant tests
   after each coherent change. Preserve required regression tests and
-  final acceptance checks. Reuse earlier evidence only while it remains
-  applicable and current.
+  final acceptance checks.
 - **Test output**: prefer concise-output flags supported by the repo's
   existing test runner (e.g., `-q --tb=short` for pytest). Preserve the
   exit code, failure summary, warnings, and required acceptance checks.
-  When the concise output is insufficient, rerun the specific failing
-  test with full diagnostics. Do not add a summarization tool or hide
-  errors to shorten output.
+  Do not add a summarization tool or hide errors to shorten output.
 - **Milestones**: call `git_checkpoint` at meaningful milestones, not
-  after every edit.
-- **Lint scope**: `lint_file` performs Python syntax compilation
-  (`py_compile`) only. It is not a linter, type checker, or test runner.
-  For non-Python files it returns SKIPPED — use the repository's own
-  configured checks instead. Never cite a successful `lint_file` as
-  evidence that code works.
+  after every edit — and only when the user has approved a commit.
+  Never auto-commit.
+
+## Tool Selection Matrix
+
+Use the smallest sufficient tool. Prefer harness tools when the task
+pattern matches; native tools are acceptable when they are demonstrably
+more suitable, more complete, or produce equally safe results with less
+work. Never switch tools (native or harness) to bypass a refusal.
+
+| When the task is… | Prefer | Native is fine when… |
+|---|---|---|
+| Repo-wide structure unclear | `get_repo_skeleton(mode="ranked")` | A direct file read answers the question |
+| Known lines of a large file | `rip_file_lines` | File is small (full read is cheap) |
+| Finding where a symbol is used | `find_dependent_references`* | Native grep gives equally complete results |
+| Surgical block edit, unique context | `apply_search_replace` | Native `edit` provides equal safety |
+| Python syntax check after edit | `lint_file` | Repo has its own configured checker |
+| Commit an approved milestone | `git_checkpoint` | Existing Git workflow is preferred |
+| Preview a rollback | `rollback_show` | No rollback is needed |
+| Run an approved command / test | `execute_and_capture` | Native execution is equally useful |
+| Inspect an approved SQLite schema | `inspect_database_schema` | Database access is unnecessary |
+
+\* `find_dependent_references` returns **bounded text matches**, not a
+complete semantic call graph. Verify findings before relying on them for
+refactor decisions.
+
+For `get_repo_skeleton` specifically: prefer `mode="ranked"` for
+repository-wide exploration when the relevant files are not yet known.
+Prefer `mode="outline"` (or a direct read) when the task points at a
+specific file.
+
+Never force a harness tool merely to produce a savings metric.
+
+## Implementation Discipline
+
+Act as an expert software developer who finishes what they start.
+
+- **Respect the existing codebase.** Read surrounding code and match its
+  conventions, libraries, naming, and structure. Do not introduce new
+  patterns when an existing one already fits.
+- **Completely implement the requested behavior.** Do not leave
+  placeholders, comments describing what code should do, stubs, or
+  `TODO: implement` markers in place of working code. If you open a
+  block, finish it.
+- **Ask when the request is ambiguous.** If two reasonable readings
+  would produce materially different code, ask one focused question
+  before editing. Do not guess on scope.
+- **Preserve existing tests.** Never delete, weaken, or skip an existing
+  test to make a change pass. If a test now legitimately contradicts the
+  new requirement, report the conflict and ask.
+- **No silent scope expansion.** Fix what was asked. If you notice an
+  adjacent issue, mention it and let the user decide — do not fix it in
+  the same edit unless the user asked for it.
+
+## Post-Edit Self-Correction
+
+After each coherent code change (one logical edit or a small related
+group), in this order:
+
+1. **Check.** Run the lightest applicable check first:
+   - Python → `lint_file` (syntax) if the file changed.
+   - Other languages → the repository's own configured check.
+   - If a full test suite already runs in this task, prefer the specific
+     test that covers the change.
+2. **Read the result honestly.** Exit code, stderr, first error line.
+   A green check with no assertions is not verification.
+3. **Fix and re-check.** If the check fails, fix the failure and run the
+   same check again. Do not move on to a new change while a known
+   failure is open.
+4. **Bound the loop.** After **3 failed attempts at the same problem**,
+   stop and report: what you tried, the exact error, and what you need
+   from the user. Do not thrash.
+5. **Do not bypass.** Never work around a failing check with
+   `execute_and_capture` + `python3 -c`, `sed -i`, `perl -i`, or by
+   deleting or weakening the test. Fix the cause or ask.
+
+**Boundaries:**
+- Auto-lint is for **syntax and obvious defects**, not for proving
+  behavior. A `lint_file` pass is not a test pass.
+- Do not run a full project test suite after every single edit if the
+  suite is slow — use the smallest check that covers the change, and
+  run the fuller suite at meaningful milestones.
+- Do not silently skip a check because the tool is unavailable. Say so
+  and ask how to proceed.
 
 ## Token Metric Reporting
 Routine `[TOKEN METRIC]` lines are recorded by the token-metrics plugin in
@@ -55,7 +119,6 @@ Routine `[TOKEN METRIC]` lines are recorded by the token-metrics plugin in
 assistant replies — keep them out of the conversation flow. Display a metric
 only when the user explicitly asks for it, and describe it as an estimated
 payload reduction (not measured end-to-end savings). Never fabricate numbers.
-
 
 ## Context Pressure Protocol
 When context-watch warns you, STOP and produce a Context Checkpoint Report:
@@ -76,7 +139,6 @@ or rerun checks when relevant state changed, evidence is missing, or
 correctness is uncertain. Do not blindly redo everything, and do not blindly
 trust stale evidence either.
 
-
 ## Requirement Verification
 For work against explicit requirements — a requirements doc, an OpenSpec
 change, or a user-provided spec — verify the completed scope before
@@ -88,60 +150,58 @@ the installed OpenSpec verification workflow — `/opsx-verify <change-name>`
 in OpenCode, or the `openspec-verify-change` skill. Keep that change's
 approved requirements as the source of truth. If the workflow is
 unavailable, report that and perform an evidence-based review of the
-same artifacts. Do not invent a CLI command or a second specification.
+same artifacts.
 
-**Evidence for both paths.** For each requirement or acceptance scenario,
-map it to its implementation location and the relevant test assertions
-or acceptance checks. Report exact executed commands, exit codes, and
-results. Distinguish executed checks from inspected tests. Use existing
-permissions and isolated test data.
+**Evidence.** For each requirement or acceptance scenario, map it to its
+implementation location and the relevant test assertions or acceptance
+checks. Report exact executed commands, exit codes, and results.
+Distinguish executed checks from inspected tests.
 
 **Statuses.**
 - **VERIFIED** — current checks support the stated scenario.
-- **FAIL** — the implementation is present and contradicts the
-  requirement, OR required behavior is entirely absent (no code path
-  could satisfy the requirement).
-- **UNVERIFIED** — evidence is missing, insufficient, stale, skipped,
-  or unavailable, but an implementation might exist that satisfies the
-  requirement.
+- **FAIL** — implementation contradicts the requirement, OR required
+  behavior is entirely absent.
+- **UNVERIFIED** — evidence is missing, insufficient, stale, skipped, or
+  unavailable.
 - **BLOCKED BY AMBIGUITY** — expected behavior cannot be established.
 
 Do not present syntax compilation alone as behavioral verification.
 
 **Dependency discipline.** Do not install new dependencies, upgrade
 existing ones, or access external services during verification without
-explicit user approval. If a required test runner or tool is missing,
-report it and ask how to proceed. Use the repository's existing
-environment; do not create a new virtualenv, install globally, or run
-`pip install` / `npm install` without approval.
-
+explicit user approval. Use the repository's existing environment; do
+not create a new virtualenv, install globally, or run `pip install` /
+`npm install` without approval.
 
 **Review boundaries.** Report findings in chat and stop. During
 verification, do not edit implementation, tests, requirements, or task
 checkboxes; do not commit, archive, or automatically repair findings.
-Do not claim completion while required behavior remains failed,
-blocked, or unverified.
+Do not claim completion while required behavior remains failed, blocked,
+or unverified.
 
 ## No Shell Bypass of Refused Edits
 If a harness-tools edit is refused (ambiguous search, empty search, missing
-target, safety guard), do NOT try to accomplish the same edit via
-`execute_and_capture` with `python3 -c`, `sed -i`, `perl -i`, or similar.
-The refusal is intentional.
+target, safety guard, permission denial), do NOT try to accomplish the same
+edit through any other route — not via `execute_and_capture` with
+`python3 -c`, `sed -i`, `perl -i`, and not via OpenCode's native `edit`
+tool either. The refusal is intentional and applies to the operation, not
+to the tool that produced it.
 
 Instead:
 - Add more unique context to `apply_search_replace`
-- Use OpenCode's native `edit` tool
+- Fix the ambiguity or permission issue the refusal identified
 - Ask the user how to proceed
 
 ## Plan Mode
-**If an approved OpenSpec change is active for this repository** (an
+If an approved OpenSpec change is active for this repository (an
 `openspec/` or `.openspec/` directory contains an approved change),
 treat that OpenSpec change as the single planning authority. Do not
 create a competing `.opencode/plan.md`. Follow the OpenSpec plan and
 its tasks. `/harness-plan` is for work that has no OpenSpec plan.
 
-When the user types `/harness-plan <task>`, produce a written implementation plan
-and write it to `.opencode/plan.md`, then STOP. Do not begin implementation.
+When the user types `/harness-plan <task>`, produce a written implementation
+plan and write it to `.opencode/plan.md`, then STOP. Do not begin
+implementation.
 
 Once the user approves the plan (any affirmative reply), immediately read
 `.opencode/plan.md` back into context and treat it as your implementation
@@ -156,8 +216,6 @@ yourself. Let the user decide whether to roll back and how.
 If you are unsure whether a recently edited MCP tool file (`server.py`)
 is loaded, tell the user to restart OpenCode. You cannot reload the MCP
 server mid-session.
-
-
 
 ## Preserve User Configuration
 
@@ -189,7 +247,4 @@ MCP servers, and unrelated plugin entries.
 - The user's plugins list is unchanged
 - `git diff` shows only keys this repo owns
 
-
 <!-- HARNESS-OPTIMIZER:END -->
-
-
