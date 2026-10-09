@@ -20,3 +20,13 @@ Returns a bounded AST/ranked map of a repository.
   Top-ranked symbols first. If truncated, a marker shows where.
   Uses a vendored copy of Aider's repomap (Apache-2.0; see
   LICENSES/ and THIRD_PARTY_NOTICES.md).
+
+  Freshness: mode="ranked" reuses an in-process map when no walked
+  file has changed (by mtime_ns + size). When a file is added,
+  edited, or removed, the next call recomputes silently. The cache
+  holds at most 5 repository roots; older entries are evicted LRU.
+  Deleted files are noticed on the next call, not eagerly.
+
+  Dependencies: ranked mode requires grep-ast and networkx (installed
+  by the harness venv). If they are not importable, mode="ranked"
+  returns a clear error and get_repo_skeleton falls back to outline.

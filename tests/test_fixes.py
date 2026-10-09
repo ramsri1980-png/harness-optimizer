@@ -1869,6 +1869,88 @@ async def test_ranked_error_fallback():
               "unavailable — ranked map unavailable" not in out, out[:300])
 
 
+async def test_ranked_freshness():
+    print("\n[Test MAP-07] get_repo_skeleton — freshness (T01 Day 3)")
+    import time
+    from harness_core import repomap_adapter
+
+    with tempfile.TemporaryDirectory() as d:
+        # Seed 3 files
+        for i in range(3):
+            with open(os.path.join(d, f"mod_{i}.py"), "w") as fh:
+                fh.write(f"def seed_{i}(x):\n    return x\n")
+
+        # Reset stats so we start clean
+        repomap_adapter._CACHE_STATS["hits"] = 0
+        repomap_adapter._CACHE_STATS["misses"] = 0
+
+        # First call — cache miss
+        text1, raw1 = repomap_adapter.build_ranked_map_with_stats(d)
+        misses1 = repomap_adapter._CACHE_STATS["misses"]
+
+        # Second call, unchanged — cache hit
+        text2, raw2 = repomap_adapter.build_ranked_map_with_stats(d)
+        hits_after_second = repomap_adapter._CACHE_STATS["hits"]
+
+        check("MAP-07: first call is a miss",
+              misses1 >= 1, f"misses={misses1}")
+        check("MAP-07: second unchanged call hits the cache",
+              hits_after_second >= 1, f"hits={hits_after_second}")
+        check("MAP-07: cached result is byte-identical",
+              text1 == text2 and raw1 == raw2,
+              f"raw1={raw1} raw2={raw2}")
+
+        # Modify one file — even with same size, mtime_ns differs
+        time.sleep(0.01)
+        with open(os.path.join(d, "mod_1.py"), "a") as fh:
+            fh.write("def added_symbol():\n    return 42\n")
+
+        text3, raw3 = repomap_adapter.build_ranked_map_with_stats(d)
+        check("MAP-07: added symbol appears after edit",
+              "added_symbol" in text3, text3[:300])
+        check("MAP-07: raw_bytes grew after edit",
+              raw3 > raw1, f"raw1={raw1} raw3={raw3}")
+
+        # Delete a file — signature changes
+        os.remove(os.path.join(d, "mod_2.py"))
+        text4, raw4 = repomap_adapter.build_ranked_map_with_stats(d)
+        check("MAP-07: deleted file's symbols disappear",
+              "seed_2" not in text4, text4[:300])
+
+
+async def test_ranked_backend_missing():
+    print("\n[Test MAP-08] get_repo_skeleton — missing backend (T01 Day 3)")
+    from unittest import mock
+    from harness_core import repomap_adapter
+
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "keep.py"), "w") as fh:
+            fh.write("def keep_me():\n    return 1\n")
+
+        # Simulate missing backend by patching the preflight helper
+        with mock.patch.object(
+                repomap_adapter, "_preflight_backend",
+                return_value="grep_ast"):
+            text, raw = repomap_adapter.build_ranked_map_with_stats(d)
+        check("MAP-08: adapter returns ERROR tuple",
+              text.startswith("ERROR")
+              and "backend not installed" in text
+              and raw == 0,
+              text[:300])
+
+        # The server should fall back cleanly to outline
+        with mock.patch.object(
+                repomap_adapter, "_preflight_backend",
+                return_value="grep_ast"):
+            out = await server.get_repo_skeleton(repo_path=d, mode="ranked")
+        check("MAP-08: server falls back to outline",
+              out.startswith("# ranked mode unavailable —")
+              and "def keep_me(" in out,
+              out[:300])
+        check("MAP-08: reason names the missing module",
+              "grep_ast" in out, out[:300])
+
+
 async def main():
     print("=" * 60)
     print("Harness-Optimizer Fix Verification")
@@ -1941,6 +2023,8 @@ async def main():
     await test_ranked_budget_and_exclusions()
     await test_ranked_metric_honest()
     await test_ranked_error_fallback()
+    await test_ranked_freshness()
+    await test_ranked_backend_missing()
     await test_outline_legacy_calls()
     await test_ranked_python_smoke()
     await test_git_subdirectory_path()

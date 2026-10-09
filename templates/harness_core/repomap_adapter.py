@@ -50,12 +50,23 @@ Behaviour guarantees
 * The returned string is capped at ``max_tokens * 4`` characters.
 * Any exception is swallowed and reported as
   ``ERROR: ranked map unavailable — <exc>``.
+* ``build_ranked_map_with_stats`` keeps a small, bounded **in-process**
+  cache (no on-disk state) keyed by the walked files' freshness
+  signature.  An unchanged tree is served from the cache; an added,
+  edited, deleted or touched file changes the signature and the map is
+  recomputed silently.  At most ``_CACHE_MAX`` roots are retained
+  (LRU eviction).
+* The backend dependencies are checked by ``_preflight_backend()``
+  before the walk, so a half-installed backend reports
+  ``ERROR: ranked map unavailable — backend not installed: <module>``
+  instead of a generic import failure.  The vendored ``repomap`` module
+  is imported lazily (inside the call), so this module itself always
+  imports cleanly.
 """
 
 import os
 import re
-
-from ._vendor.aider import repomap
+import threading
 
 # Extension → language label, as reported in the ``# languages:`` header
 # line.  Only languages that actually contributed at least one file are
@@ -88,6 +99,15 @@ _SKIP_DIRS = {
 _MAX_FILES = 500
 _TRUNCATION_MARKER = "\n... [truncated] ...\n"
 
+# In-process freshness cache.  Bounded to _CACHE_MAX roots and pruned
+# least-recently-used first; nothing is ever written to disk and no cache
+# activity is ever printed (stdout is the MCP protocol channel).
+_CACHE = {}                 # root -> {"sig": <tuple>, "text": str, "raw_bytes": int}
+_CACHE_ORDER = []           # list of roots, most-recently-used first
+_CACHE_MAX = 5              # bound the number of cached roots
+_CACHE_STATS = {"hits": 0, "misses": 0}
+_CACHE_LOCK = threading.Lock()
+
 
 def _source_files(root, limit=_MAX_FILES):
     """Return an absolute list of source files under *root* whose
@@ -104,6 +124,39 @@ def _source_files(root, limit=_MAX_FILES):
             if len(found) >= limit:
                 return found
     return found
+
+
+def _signature(files, root):
+    """Return a hashable signature of the walked source files:
+    sorted (relative_path, mtime_ns, size) tuples. mtime_ns alone is
+    not enough — a same-size, same-mtime write should still be caught
+    by size, and a same-size same-second edit is caught by ns
+    resolution on all supported filesystems.
+
+    ``root`` is only used to render the relative paths (the cache key is
+    the root itself, so the relative form is a cheap stability guard, not
+    the freshness signal).  A file that vanishes between the walk and the
+    stat is skipped, exactly like ``_raw_bytes`` skips it.
+    """
+    rows = []
+    for fname in files:
+        try:
+            st = os.stat(fname)
+        except OSError:
+            continue
+        rows.append((os.path.relpath(fname, root), st.st_mtime_ns, st.st_size))
+    return tuple(sorted(rows))
+
+
+def cache_stats():
+    """Return a dict with 'hits', 'misses', 'size'.
+    Intended for tests; safe to call from production."""
+    with _CACHE_LOCK:
+        return {
+            "hits": _CACHE_STATS["hits"],
+            "misses": _CACHE_STATS["misses"],
+            "size": len(_CACHE),
+        }
 
 
 def _languages_present(files):
@@ -187,6 +240,28 @@ def _raw_bytes(files):
     return total
 
 
+def _preflight_backend():
+    """Verify the Python deps required by the ranked map are
+    importable. Return None on success, or a short reason string
+    naming the missing module.
+
+    ``grep_ast`` and ``networkx`` are checked explicitly because the
+    vendored module only imports ``grep_ast`` at module scope while
+    ``networkx`` is imported later, during ranking — either one missing
+    would otherwise surface as a generic failure.
+    """
+    for name in ("grep_ast", "networkx"):
+        try:
+            __import__(name)
+        except ImportError:
+            return name
+    try:
+        from ._vendor.aider import repomap  # noqa: F401
+    except ImportError as exc:
+        return getattr(exc, "name", None) or str(exc)
+    return None
+
+
 def build_ranked_map_with_stats(repo_path, task_hint="", max_tokens=1500):
     """Same as ``build_ranked_map`` but returns ``(text, raw_bytes)``
     where ``raw_bytes`` is the sum of ``os.path.getsize()`` for every
@@ -197,6 +272,15 @@ def build_ranked_map_with_stats(repo_path, task_hint="", max_tokens=1500):
     output length.  On the error paths it is ``0``.
     """
     try:
+        reason = _preflight_backend()
+        if reason:
+            return (
+                f"ERROR: ranked map unavailable — backend not installed: {reason}",
+                0,
+            )
+
+        from ._vendor.aider import repomap
+
         root = os.path.realpath(os.path.abspath(repo_path))
         if not os.path.isdir(root):
             return f"ERROR: ranked map unavailable — not a directory: {root}", 0
@@ -204,6 +288,23 @@ def build_ranked_map_with_stats(repo_path, task_hint="", max_tokens=1500):
         files = _source_files(root)
         if not files:
             return f"# ranked source map — 0 files, 0 symbols\n# {root}", 0
+
+        # Freshness signature: walk + stat only (cheap next to ranking).
+        # ``task_hint`` and ``max_tokens`` are part of the signature so a
+        # differently-parameterised call can never be served the wrong
+        # cached rendering.
+        sig = (_signature(files, root), task_hint, max_tokens)
+
+        with _CACHE_LOCK:
+            cached = _CACHE.get(root)
+            if cached is not None and cached["sig"] == sig:
+                _CACHE_STATS["hits"] += 1
+                # move root to front of LRU
+                if root in _CACHE_ORDER:
+                    _CACHE_ORDER.remove(root)
+                _CACHE_ORDER.insert(0, root)
+                return cached["text"], cached["raw_bytes"]
+            _CACHE_STATS["misses"] += 1
 
         raw_bytes = _raw_bytes(files)
 
@@ -284,6 +385,18 @@ def build_ranked_map_with_stats(repo_path, task_hint="", max_tokens=1500):
             text += _TRUNCATION_MARKER
         if len(text) > cap:
             text = text[: max(1, cap - len(_TRUNCATION_MARKER))] + _TRUNCATION_MARKER
+
+        # Normal, rendered map only: error tuples and the degenerate
+        # header-only early return above are never cached.
+        with _CACHE_LOCK:
+            _CACHE[root] = {"sig": sig, "text": text, "raw_bytes": raw_bytes}
+            if root in _CACHE_ORDER:
+                _CACHE_ORDER.remove(root)
+            _CACHE_ORDER.insert(0, root)
+            while len(_CACHE_ORDER) > _CACHE_MAX:
+                evict = _CACHE_ORDER.pop()
+                _CACHE.pop(evict, None)
+
         return text, raw_bytes
     except Exception as exc:
         return f"ERROR: ranked map unavailable — {exc}", 0
