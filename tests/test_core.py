@@ -1,4 +1,4 @@
-"""CORE regression tests (Days 1-2): CORE-08..10 and CORE-04..07.
+"""CORE regression tests (Days 1-3): CORE-01..10.
 
 Wired into tests/test_fixes.py via run() so its final tally includes these
 checks. Each check is also recorded in ``check_results`` as a
@@ -319,6 +319,93 @@ def test_core_07_formatter_combined_limits():
     return ok
 
 
+def test_core_01_vendor_import_offline():
+    print("\n[CORE-01] vendor import works offline")
+    ok = True
+    try:
+        from harness_core import repomap_adapter
+        ok &= _check("CORE-01: adapter imports", True)
+        ok &= _check(
+            "CORE-01: build_ranked_map_with_stats callable",
+            callable(repomap_adapter.build_ranked_map_with_stats),
+        )
+        ok &= _check(
+            "CORE-01: no Aider agent constructed at import",
+            not hasattr(repomap_adapter, "Coder")
+            and not hasattr(repomap_adapter, "aider_coder"),
+        )
+    except Exception as exc:
+        ok &= _check("CORE-01: adapter imports", False, str(exc)[:80])
+    return ok
+
+
+def test_core_02_packaged_queries():
+    print("\n[CORE-02] packaged queries resolve from installed path")
+    ok = True
+    from harness_core._vendor.aider import repomap as _vrepomap
+    import os
+    queries_dir = os.path.join(
+        os.path.dirname(_vrepomap.__file__), "queries"
+    )
+    ok &= _check(
+        "CORE-02: queries dir exists",
+        os.path.isdir(queries_dir),
+        queries_dir,
+    )
+    tsl = os.path.join(queries_dir, "tree-sitter-language-pack")
+    tslang = os.path.join(queries_dir, "tree-sitter-languages")
+    ok &= _check(
+        "CORE-02: language-pack queries present",
+        os.path.isdir(tsl),
+    )
+    ok &= _check(
+        "CORE-02: languages queries present",
+        os.path.isdir(tslang),
+    )
+    candidates = [
+        os.path.join(tsl, "python-tags.scm"),
+        os.path.join(tslang, "python-tags.scm"),
+    ]
+    ok &= _check(
+        "CORE-02: python-tags.scm present in at least one backend",
+        any(os.path.isfile(p) for p in candidates),
+    )
+    return ok
+
+
+def test_core_03_protocol_cleanliness():
+    print("\n[CORE-03] protocol cleanliness — no stray stdout")
+    ok = True
+    import io
+    import contextlib
+    import importlib
+    try:
+        from harness_core._vendor.aider import repomap as _vrepomap
+    except Exception as exc:
+        ok &= _check("CORE-03: import works", False, str(exc)[:80])
+        return ok
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        importlib.reload(_vrepomap)
+    stray = buf.getvalue()
+    ok &= _check(
+        "CORE-03: repomap import is stdout-clean",
+        stray == "",
+        f"stdout={stray[:120]!r}",
+    )
+    from harness_core import tool_output as _to
+    buf2 = io.StringIO()
+    with contextlib.redirect_stdout(buf2):
+        importlib.reload(_to)
+    stray2 = buf2.getvalue()
+    ok &= _check(
+        "CORE-03: tool_output import is stdout-clean",
+        stray2 == "",
+        f"stdout={stray2[:120]!r}",
+    )
+    return ok
+
+
 def run():
     results = []
     results.append(test_core_08_snapshot_changes_during_read())
@@ -328,4 +415,7 @@ def run():
     results.append(test_core_05_corruption_recovery())
     results.append(test_core_06_cache_worktree_isolation())
     results.append(test_core_07_formatter_combined_limits())
+    results.append(test_core_01_vendor_import_offline())
+    results.append(test_core_02_packaged_queries())
+    results.append(test_core_03_protocol_cleanliness())
     return all(results)

@@ -19,6 +19,20 @@ import tempfile
 
 from fastmcp import Context, FastMCP
 
+# ── Graceful CORE imports (Day 3) ───────────────────────────
+# Light installations may ship without harness_core; the public tools
+# must keep working on their inline implementations in that case, so a
+# failed import degrades to None instead of failing the module.
+try:
+    from harness_core import tool_output as _tool_output
+except Exception:
+    _tool_output = None
+
+try:
+    from harness_core import workspace as _workspace
+except Exception:
+    _workspace = None
+
 mcp = FastMCP("HarnessTools")
 
 # ── Tool toggle ─────────────────────────────────────────────
@@ -323,7 +337,21 @@ async def rip_file_lines(file_path: str, start_line: int, end_line: int, ctx: Co
     except OSError as exc:
         return f"Failed to rip file ranges: {exc}"
 
-    fingerprint = hashlib.sha256(raw_bytes).hexdigest()
+    fingerprint = None
+    if _workspace is not None:
+        # Day 3: fingerprint through the approved-workspace snapshot so
+        # the sha256 comes from the policy-checked read path. Any policy
+        # miss (outside every root, sensitive pattern) or I/O race falls
+        # back to hashing the bytes already read, keeping the response
+        # byte-identical to the pre-migration behaviour.
+        try:
+            ws = _workspace.Workspace(
+                roots=[os.path.dirname(os.path.abspath(file_path))])
+            fingerprint = ws.snapshot(file_path).sha256
+        except (_workspace.WorkspaceError, OSError):
+            fingerprint = None
+    if fingerprint is None:
+        fingerprint = hashlib.sha256(raw_bytes).hexdigest()
     text = raw_bytes.decode("utf-8", errors="replace")
     # Disclose any substitution so the caller knows the view is lossy.
     utf8_lossy = "\ufffd" in text
@@ -1096,7 +1124,14 @@ def _truncate_middle(text: str, limit: int,
     marker also reports how many lines the head/tail selection dropped:
     `... [truncated: N entries omitted] ...`. The budget is reserved
     with the worst-case (largest) count first, so the real marker can
-    only be shorter than the space reserved for it."""
+    only be shorter than the space reserved for it.
+
+    Delegates to ``harness_core.tool_output.truncate_middle`` when the
+    CORE module is importable; otherwise the inline fallback below runs
+    so server.py stays self-sufficient."""
+    if _tool_output is not None:
+        return _tool_output.truncate_middle(text, limit, count_label)
+    # Fallback: keep the existing inline implementation here.
     if len(text) <= limit:
         return text
     lines = text.splitlines(keepends=True)
@@ -1518,15 +1553,15 @@ async def execute_and_capture(command: str, timeout_seconds: int = 15,
 
     if len(kept) > MAX_OUTPUT_CHARS:
         half = MAX_OUTPUT_CHARS // 2
-        dropped = len(kept) - MAX_OUTPUT_CHARS
+        unclipped = kept
         dropped_bytes += len(
-            kept[half:len(kept) - half].encode("utf-8", "replace")
+            unclipped[half:len(unclipped) - half].encode("utf-8", "replace")
         )
-        kept = (
-            kept[:half]
-            + f"\n... [ CLIPPED: {dropped} chars dropped to stay under {MAX_OUTPUT_CHARS} ] ...\n"
-            + kept[-half:]
-        )
+        # Line-aware middle truncation keeps the head and the tail of
+        # the payload; the applied-limit note below reports the exact
+        # number of characters the truncation dropped.
+        kept = _truncate_middle(unclipped, MAX_OUTPUT_CHARS)
+        dropped = len(unclipped) - len(kept)
         limit_notes.append(f"{dropped} chars dropped to stay under {MAX_OUTPUT_CHARS}")
 
     # ── B3: explicit status flags, always present ──
