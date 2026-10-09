@@ -101,6 +101,7 @@ if (FLAGS.uninstall) {
     path.join(TOOLS_DIR, "venv"),
     path.join(TOOLS_DIR, "server.py"),
     path.join(TOOLS_DIR, "harness-config-ui.py"),
+    path.join(TOOLS_DIR, "harness_core"),
   ];
   const isUserCheckout = fs.existsSync(path.join(TOOLS_DIR, ".git"));
   for (const f of runtimeArtifacts) {
@@ -335,6 +336,23 @@ if (!fs.existsSync(serverTemplate)) fail("templates/server.py missing from packa
 fs.copyFileSync(serverTemplate, path.join(TOOLS_DIR, "server.py"));
 info("Installed server.py");
 
+const coreSrc = path.join(__dirname, "..", "templates", "harness_core");
+const coreDst = path.join(TOOLS_DIR, "harness_core");
+if (fs.existsSync(coreSrc)) {
+  fs.mkdirSync(coreDst, { recursive: true });
+  const realSrc = fs.realpathSync(coreSrc);
+  const realDst = fs.realpathSync(coreDst);
+  if (realSrc === realDst) {
+    info("harness_core already in place (skipped copy)");
+  } else {
+    fs.cpSync(coreSrc, coreDst, {
+      recursive: true,
+      filter: (s) => !s.includes("__pycache__"),
+    });
+    info("Installed harness_core");
+  }
+}
+
 const uiTemplate = path.join(__dirname, "..", "templates", "harness-config-ui.py");
 if (fs.existsSync(uiTemplate)) {
   fs.copyFileSync(uiTemplate, path.join(TOOLS_DIR, "harness-config-ui.py"));
@@ -356,6 +374,7 @@ if (!FLAGS.noRuntime) {
   info("Ensuring FastMCP is installed...");
   execSync(`${venvPip} install --quiet --upgrade pip`, { cwd: TOOLS_DIR, stdio: "inherit" });
   execSync(`${venvPip} install --quiet fastmcp`, { cwd: TOOLS_DIR, stdio: "inherit" });
+  execSync(`${venvPip} install --quiet grep-ast networkx`, { cwd: TOOLS_DIR, stdio: "inherit" });
 
   info("Testing server...");
   const test = spawnSync(venvPy, ["-c", `

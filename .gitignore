@@ -1,6 +1,7 @@
 # Installer artifacts (copied from templates/ into repo root at install time)
 /server.py
 /harness-config-ui.py
+/harness_core
 
 # Python
 __pycache__/

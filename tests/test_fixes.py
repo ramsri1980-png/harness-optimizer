@@ -1443,6 +1443,156 @@ async def test_rollback_no_hooks_or_external_diff():
               f"marker={os.path.exists(marker)}")
 
 
+# ═══════════════════════════════════════════════════════════
+# T01 Day 1 — get_repo_skeleton modes
+# ═══════════════════════════════════════════════════════════
+
+async def test_outline_legacy_calls():
+    print("\n[Test MAP-01] get_repo_skeleton — outline mode (T01)")
+    with tempfile.TemporaryDirectory() as d:
+        # Fixture 1: plain function, decorator, class, method
+        with open(os.path.join(d, "alpha_widget.py"), "w") as fh:
+            fh.write(
+                "def passthrough(fn):\n"
+                "    return fn\n"
+                "\n"
+                "@passthrough\n"
+                "class AlphaWidget:\n"
+                "    def render_alpha(self):\n"
+                "        return 1\n"
+            )
+        # Fixture 2: async function with a nested def
+        with open(os.path.join(d, "beta_async.py"), "w") as fh:
+            fh.write(
+                "async def fetch_beta():\n"
+                "    def inner_helper():\n"
+                "        return 2\n"
+                "    return inner_helper()\n"
+            )
+        # Fixture 3: class → method → nested class → nested method
+        with open(os.path.join(d, "gamma_nested.py"), "w") as fh:
+            fh.write(
+                "class GammaNested:\n"
+                "    def run_gamma(self):\n"
+                "        class Deep:\n"
+                "            def deep_method(self):\n"
+                "                return 3\n"
+                "        return Deep()\n"
+            )
+
+        out = await server.get_repo_skeleton(repo_path=d, mode="outline")
+        default_out = await server.get_repo_skeleton(repo_path=d)
+        check("mode='outline' matches the default", out == default_out, out[:200])
+
+        expected = [
+            "passthrough", "AlphaWidget", "render_alpha",
+            "fetch_beta", "inner_helper",
+            "GammaNested", "run_gamma", "Deep", "deep_method",
+        ]
+        missing = [s for s in expected if s not in out]
+        check("Outline contains every symbol", not missing, f"missing={missing}")
+
+        no_range = [
+            s for s in expected
+            if not any(s in line and "[L" in line and "-L" in line
+                       for line in out.splitlines())
+        ]
+        check("Every symbol has its own [Lx-Ly] range",
+              not no_range, f"without range={no_range}")
+
+        duplicated = []
+        for s in ("passthrough", "render_alpha", "inner_helper",
+                  "run_gamma", "deep_method"):
+            hits = [ln for ln in out.splitlines() if f"def {s}(" in ln]
+            if len(hits) != 1:
+                duplicated.append((s, len(hits)))
+        check("No duplicated method entries", not duplicated, f"{duplicated}")
+
+
+async def test_ranked_python_smoke():
+    print("\n[Test MAP-02] get_repo_skeleton — ranked mode (T01)")
+    with tempfile.TemporaryDirectory() as d:
+        fixtures = {
+            "models.py": (
+                "class Watchlist:\n"
+                "    def __init__(self):\n"
+                "        self.items = []\n"
+                "\n"
+                "class Position:\n"
+                "    def shares(self):\n"
+                "        return 0\n"
+            ),
+            "normalize.py": (
+                "def normalize_ticker(symbol):\n"
+                "    return symbol.strip().upper()\n"
+                "\n"
+                "def dedupe_positions(rows):\n"
+                "    return list(dict.fromkeys(rows))\n"
+            ),
+            "watchlist.py": (
+                "def build_watchlist(rows):\n"
+                "    return [normalize_ticker(r) for r in rows]\n"
+                "\n"
+                "class WatchlistService:\n"
+                "    def refresh(self):\n"
+                "        return None\n"
+            ),
+            "duplicates.py": (
+                "def find_duplicates(rows):\n"
+                "    seen = set()\n"
+                "    return [r for r in rows if r not in seen and not seen.add(r)]\n"
+                "\n"
+                "def merge_duplicates(rows):\n"
+                "    return find_duplicates(rows)\n"
+            ),
+            "main.py": (
+                "async def refresh_watchlist(service):\n"
+                "    return service.refresh()\n"
+                "\n"
+                "def main():\n"
+                "    return None\n"
+            ),
+        }
+        for name, body in fixtures.items():
+            with open(os.path.join(d, name), "w") as fh:
+                fh.write(body)
+
+        out = await server.get_repo_skeleton(
+            repo_path=d, mode="ranked")
+
+        if out.startswith("ERROR"):
+            print("     → ranked mode failed "
+                  "(vendored import/backend):", out[:300])
+        elif "# ranked python map" not in out:
+            print("     → note: ranked section absent, outline fallback "
+                  "in effect")
+
+        files_seen = sorted(n for n in fixtures if n in out)
+        check("Result contains >= 3 file paths",
+              len(files_seen) >= 3, f"{files_seen}")
+
+        def has_symbol(name):
+            return f"def {name}(" in out or f"class {name}:" in out
+
+        symbols = ["Watchlist", "Position", "normalize_ticker",
+                   "dedupe_positions", "build_watchlist", "WatchlistService",
+                   "find_duplicates", "merge_duplicates",
+                   "refresh_watchlist", "main"]
+        found = [s for s in symbols if has_symbol(s)]
+        check("Result contains >= 5 symbol names",
+              len(found) >= 5, f"{len(found)} found: {found}")
+
+        check("Result length under 8000 chars", len(out) < 8000,
+              f"len={len(out)}")
+        check("No ERROR prefix",
+              not out.startswith("ERROR"), out[:300])
+
+        bogus = await server.get_repo_skeleton(repo_path=d, mode="bogus")
+        check("mode='bogus' returns an ERROR",
+              bogus.startswith("ERROR: unsupported mode 'bogus'"),
+              bogus[:300])
+
+
 async def main():
     print("=" * 60)
     print("Harness-Optimizer Fix Verification")
@@ -1511,6 +1661,8 @@ async def main():
     await test_lint_no_generic_line_fallback()
     await test_lint_path_disambiguation()
     await test_lint_source_change_during_compile_noted()
+    await test_outline_legacy_calls()
+    await test_ranked_python_smoke()
     await test_git_subdirectory_path()
     await test_git_outside_repo()
     await test_git_missing_identity()

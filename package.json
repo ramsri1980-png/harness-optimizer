@@ -12,6 +12,8 @@
     "!templates/**/*.pyc",
     "docs/",
     "studio_extensions/",
+    "LICENSES/",
+    "THIRD_PARTY_NOTICES.md",
     "README.md"
   ],
   "engines": {

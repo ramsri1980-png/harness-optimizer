@@ -65,8 +65,11 @@ async def emit_metric(ctx: Context, tool: str, saved: int, baseline: int, actual
 # ═══════════════════════════════════════════════════════════
 
 @register("get_repo_skeleton")
-async def get_repo_skeleton(repo_path: str = ".", max_files: int = 500):
+async def get_repo_skeleton(repo_path: str = ".", max_files: int = 500,
+                            mode: str = "outline"):
     import ast
+    if mode not in ("outline", "ranked"):
+        return f"ERROR: unsupported mode '{mode}' — use 'outline' or 'ranked'"
     root = os.path.abspath(os.path.expanduser(repo_path))
     if not os.path.isdir(root):
         return f"ERROR: Not a directory: {root}"
@@ -152,7 +155,26 @@ async def get_repo_skeleton(repo_path: str = ".", max_files: int = 500):
         f"saved={saved} baseline={baseline} actual={actual} type=payload_reduction"
     )
 
-    return skeleton_text + "\n\n" + metric
+    outline = skeleton_text + "\n\n" + metric
+    if mode == "outline":
+        return outline
+
+    # mode == "ranked": append the vendored repo-map rendering.
+    try:
+        from harness_core import repomap_adapter
+        ranked = repomap_adapter.build_ranked_python_map(root)
+    except Exception as exc:
+        ranked = f"ERROR: ranked map unavailable — {exc}"
+
+    if isinstance(ranked, str) and ranked.startswith("ERROR"):
+        reason = ranked.split("ERROR:", 1)[-1].strip()
+        redundant = "ranked map unavailable — "
+        if reason.startswith(redundant):
+            reason = reason[len(redundant):]
+        note = f"# ranked mode unavailable — {reason}; falling back to outline"
+        return note + "\n" + outline
+
+    return skeleton_text + "\n\n" + ranked + "\n\n" + metric
 
 # T02 tuning constants for rip_file_lines
 _RIP_MAX_CHARS = 4000          # hard response cap
