@@ -240,6 +240,9 @@ async def test_mcp_entry_preferences_preserved():
         cfg_path = home / ".config" / "opencode" / "opencode.json"
         cfg = json.load(open(cfg_path))
         cfg["mcp"]["servers"]["harness-tools"]["environment"] = {"HARNESS_TOOLS": "none"}
+        # Simulate a config from a pre-0.13.2 install, which wrote
+        # `disabled` and never wrote `enabled`.
+        cfg["mcp"]["servers"]["harness-tools"].pop("enabled", None)
         cfg["mcp"]["servers"]["harness-tools"]["disabled"] = True
         cfg_path.write_text(json.dumps(cfg, indent=2))
 
@@ -250,8 +253,10 @@ async def test_mcp_entry_preferences_preserved():
         check("HARNESS_TOOLS preserved",
               ht.get("environment", {}).get("HARNESS_TOOLS") == "none",
               str(ht)[:300])
-        check("disabled flag preserved",
-              ht.get("disabled") is True, str(ht)[:300])
+        check("legacy disabled migrated to enabled: false",
+              ht.get("enabled") is False, str(ht)[:300])
+        check("legacy disabled key removed",
+              "disabled" not in ht, str(ht)[:300])
 
 
 async def test_cumulative_limits():
