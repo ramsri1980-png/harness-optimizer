@@ -25,6 +25,10 @@ Use the smallest sufficient context — not the smallest possible excerpt.
   - The file is small (full read is cheap)
   - You need the whole file to reason
   - You're exploring without a specific target
+  For `get_repo_skeleton` specifically: prefer mode="ranked" for
+  repository-wide exploration when the relevant files are not yet known.
+  Prefer mode="outline" (or a direct read) when the task points at a
+  specific file.
   Never force a harness tool merely to produce a savings metric, and never
   bypass a refused operation or permission restriction.
 - **Verification**: run language-appropriate checks and relevant tests

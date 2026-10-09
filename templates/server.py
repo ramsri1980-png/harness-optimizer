@@ -66,7 +66,7 @@ async def emit_metric(ctx: Context, tool: str, saved: int, baseline: int, actual
 
 @register("get_repo_skeleton")
 async def get_repo_skeleton(repo_path: str = ".", max_files: int = 500,
-                            mode: str = "outline"):
+                            mode: str = "outline", max_tokens: int = 1500):
     import ast
     if mode not in ("outline", "ranked"):
         return f"ERROR: unsupported mode '{mode}' — use 'outline' or 'ranked'"
@@ -159,12 +159,14 @@ async def get_repo_skeleton(repo_path: str = ".", max_files: int = 500,
     if mode == "outline":
         return outline
 
-    # mode == "ranked": append the vendored repo-map rendering.
+    # mode == "ranked": return ONLY the ranked map + metric (no outline).
     try:
         from harness_core import repomap_adapter
-        ranked = repomap_adapter.build_ranked_python_map(root)
+        ranked, raw_bytes = repomap_adapter.build_ranked_map_with_stats(
+            root, max_tokens=max_tokens)
     except Exception as exc:
         ranked = f"ERROR: ranked map unavailable — {exc}"
+        raw_bytes = 0
 
     if isinstance(ranked, str) and ranked.startswith("ERROR"):
         reason = ranked.split("ERROR:", 1)[-1].strip()
@@ -174,7 +176,20 @@ async def get_repo_skeleton(repo_path: str = ".", max_files: int = 500,
         note = f"# ranked mode unavailable — {reason}; falling back to outline"
         return note + "\n" + outline
 
-    return skeleton_text + "\n\n" + ranked + "\n\n" + metric
+    # Honest metric: the ranked text is a truncation of the raw sources,
+    # so the baseline is the token count of the bytes actually read
+    # (``raw_bytes``, summed from os.path.getsize over the walked files),
+    # and the actual is the token count of the returned ranked text.
+    # No estimate is derived from the output length itself.
+    ranked_actual = estimate_tokens(ranked)
+    ranked_baseline = estimate_tokens(" " * raw_bytes)
+    ranked_saved = max(0, ranked_baseline - ranked_actual)
+    ranked_metric = (
+        f"[TOKEN METRIC] tool=get_repo_skeleton "
+        f"saved={ranked_saved} baseline={ranked_baseline} actual={ranked_actual} "
+        f"type=payload_reduction"
+    )
+    return ranked + "\n\n" + ranked_metric
 
 # T02 tuning constants for rip_file_lines
 _RIP_MAX_CHARS = 4000          # hard response cap

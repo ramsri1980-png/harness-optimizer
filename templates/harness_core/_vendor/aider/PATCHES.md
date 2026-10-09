@@ -13,6 +13,12 @@ Files vendored:
   → `templates/harness_core/_vendor/aider/queries/tree-sitter-language-pack/python-tags.scm`
 - `aider/queries/tree-sitter-languages/python-tags.scm`
   → `templates/harness_core/_vendor/aider/queries/tree-sitter-languages/python-tags.scm`
+- `aider/queries/tree-sitter-language-pack/javascript-tags.scm` (Day 2)
+  → `templates/harness_core/_vendor/aider/queries/tree-sitter-language-pack/javascript-tags.scm`
+- `aider/queries/tree-sitter-languages/javascript-tags.scm` (Day 2)
+  → `templates/harness_core/_vendor/aider/queries/tree-sitter-languages/javascript-tags.scm`
+- `aider/queries/tree-sitter-languages/typescript-tags.scm` (Day 2)
+  → `templates/harness_core/_vendor/aider/queries/tree-sitter-languages/typescript-tags.scm`
 
 Every edit made to the vendored `repomap.py` is listed below as
 `original` → `replacement`.
@@ -143,6 +149,62 @@ so the vendored copies mirror that layout instead of sitting flat in
   `queries/tree-sitter-languages/*.scm`.
 - Day 1 ships **Python only**: both `python-tags.scm` files were copied
   (both subdirs are needed because `USING_TSL_PACK` selects between them).
+- **Day 2 adds JavaScript, TypeScript and TSX.**  Three more `.scm` files
+  were copied from the pinned commit:
+
+  | Language | `tree-sitter-language-pack/` | `tree-sitter-languages/` |
+  |---|---|---|
+  | javascript | `javascript-tags.scm` | `javascript-tags.scm` |
+  | typescript | **not shipped upstream** | `typescript-tags.scm` |
+  | tsx | **not shipped upstream** | **not shipped upstream** |
+
+  `get_scm_fname(lang)` already falls back: when `USING_TSL_PACK` is true
+  it tries `tree-sitter-language-pack/<lang>-tags.scm` first and, if that
+  path does not exist, falls through to `tree-sitter-languages/<lang>-tags.scm`.
+  Both subdirs are still vendored, so whichever backend is in use resolves.
+
+### TSX (deviation — recorded as required)
+
+Upstream Aider ships **no `tsx-tags.scm` in either query directory**, so
+none was copied. TSX still works, because the extension→language mapping
+used by the vendored module (`grep_ast.filename_to_lang`) reports `.tsx`
+as **`typescript`**, not `tsx`:
+
+```
+a.ts  → typescript
+a.tsx → typescript
+```
+
+So `.tsx` files are parsed with the `typescript` grammar and tagged with
+`typescript-tags.scm`.  This is verified behaviour, not an assumption:
+`export function PanelWidget(...)` / `export class BoxWidget` inside
+JSX-bearing `.tsx` files produce normal `def` tags with correct line
+numbers (tree-sitter's error recovery handles the JSX nodes).
+
+**Known limitation (reported, not silently skipped):** because the
+`typescript` grammar is used rather than the dedicated `tsx` grammar, and
+because upstream `typescript-tags.scm` has no `lexical_declaration` /
+arrow-function rule, a TSX *arrow* component is **not** captured as a
+`def`:
+
+```tsx
+export const FooterWidget = () => <footer>f</footer>;   // ← no def tag
+export function PanelWidget() { return <div/>; }        // ← def tag ✓
+```
+
+Arrow components still appear in the map as pygments-backfilled `ref`
+tags, so the file is never silently dropped — only the `def` tag is
+missing. Fixing this properly needs an upstream `tsx-tags.scm` (or an
+arrow rule in `typescript-tags.scm`) plus teaching the language lookup to
+map `.tsx` → `tsx`; both would be changes to vendored files, so they are
+deliberately **not** made here.
+
+### `.jsx`
+
+Upstream also ships no `jsx-tags.scm`; `filename_to_lang(".jsx")` reports
+`javascript`, so `.jsx` is tagged with `javascript-tags.scm`.  Note the
+JavaScript query has no JSX-specific rules either, so JSX *arrow*
+components in `.jsx` files have the same `def`-tag limitation as TSX above.
 
 ## PageRank without numpy/scipy
 

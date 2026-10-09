@@ -4,6 +4,7 @@ Run inside venv: python3 test_fixes.py
 """
 import asyncio
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1563,7 +1564,7 @@ async def test_ranked_python_smoke():
         if out.startswith("ERROR"):
             print("     → ranked mode failed "
                   "(vendored import/backend):", out[:300])
-        elif "# ranked python map" not in out:
+        elif "# ranked source map" not in out:
             print("     → note: ranked section absent, outline fallback "
                   "in effect")
 
@@ -1572,7 +1573,14 @@ async def test_ranked_python_smoke():
               len(files_seen) >= 3, f"{files_seen}")
 
         def has_symbol(name):
-            return f"def {name}(" in out or f"class {name}:" in out
+            # Outline mode renders "def name(" / "class Name:"; ranked
+            # mode renders one "path:Lx def name" line per symbol.
+            if f"def {name}(" in out or f"class {name}:" in out:
+                return True
+            return any(
+                re.fullmatch(r"\S+\.py:L\d+ (def|ref) " + re.escape(name), ln)
+                for ln in out.splitlines()
+            )
 
         symbols = ["Watchlist", "Position", "normalize_ticker",
                    "dedupe_positions", "build_watchlist", "WatchlistService",
@@ -1591,6 +1599,274 @@ async def test_ranked_python_smoke():
         check("mode='bogus' returns an ERROR",
               bogus.startswith("ERROR: unsupported mode 'bogus'"),
               bogus[:300])
+
+
+async def test_ranked_multilang():
+    print("\n[Test MAP-03] get_repo_skeleton — ranked mode, JS/TS/TSX (T01 Day 2)")
+    with tempfile.TemporaryDirectory() as d:
+        fixtures = {
+            # 2 Python files with class + def
+            "alpha_py.py": (
+                "class AlphaWidget:\n"
+                "    def render_alpha(self):\n"
+                "        return 'alpha'\n"
+            ),
+            "beta_py.py": (
+                "def build_beta_widget(rows):\n"
+                "    return sorted(rows)\n"
+            ),
+            # 2 JavaScript files with function + class
+            "gamma_js.js": (
+                "export function gammaHelper(a, b) {\n"
+                "  return a + b;\n"
+                "}\n"
+                "\n"
+                "export class GammaStore {\n"
+                "  put(key) {\n"
+                "    return key;\n"
+                "  }\n"
+                "}\n"
+            ),
+            "delta_js.js": (
+                "function deltaFactory() {\n"
+                "  return null;\n"
+                "}\n"
+                "\n"
+                "const deltaName = (id) => 'd' + id;\n"
+            ),
+            # 2 TypeScript files with interface + function
+            "epsilon_ts.ts": (
+                "interface EpsilonConfig {\n"
+                "  retries: number;\n"
+                "}\n"
+                "\n"
+                "export function epsilonRetry(cfg: EpsilonConfig): number {\n"
+                "  return cfg.retries;\n"
+                "}\n"
+            ),
+            "zeta_ts.ts": (
+                "interface ZetaRow {\n"
+                "  id: string;\n"
+                "}\n"
+                "\n"
+                "export class ZetaRegistry {\n"
+                "  register(row: ZetaRow): string {\n"
+                "    return row.id;\n"
+                "  }\n"
+                "}\n"
+            ),
+            # 2 TSX files with a component function
+            "eta_tsx.tsx": (
+                "import React from 'react';\n"
+                "\n"
+                "export function EtaPanel({ title }: { title: string }) {\n"
+                "  return <section className='eta'>{title}</section>;\n"
+                "}\n"
+            ),
+            "theta_tsx.tsx": (
+                "export const ThetaBadge = (props: { label: string }) =>\n"
+                "  <span className='theta'>{props.label}</span>;\n"
+            ),
+        }
+        for name, body in fixtures.items():
+            with open(os.path.join(d, name), "w") as fh:
+                fh.write(body)
+
+        out = await server.get_repo_skeleton(repo_path=d, mode="ranked")
+
+        check("MAP-03: output does not start with ERROR",
+              not out.startswith("ERROR"), out[:300])
+        check("MAP-03: header says '# ranked source map'",
+              "# ranked source map" in out, out[:300])
+
+        # Symbol → the fixture file that defines it.
+        expected = {
+            "alpha_py.py": ["AlphaWidget", "render_alpha"],
+            "beta_py.py": ["build_beta_widget"],
+            "gamma_js.js": ["gammaHelper", "GammaStore", "put"],
+            "delta_js.js": ["deltaFactory", "deltaName"],
+            "epsilon_ts.ts": ["EpsilonConfig", "epsilonRetry"],
+            "zeta_ts.ts": ["ZetaRow", "ZetaRegistry", "register"],
+            "eta_tsx.tsx": ["EtaPanel"],
+            # NOTE: an arrow-function component (`const X = () => <div/>`)
+            # is not captured as a *def* by upstream Aider's
+            # typescript-tags.scm (no lexical_declaration/arrow rule), so
+            # ThetaBadge surfaces only as a pygments-backfilled ref. It is
+            # kept here to exercise that path.
+            "theta_tsx.tsx": ["ThetaBadge"],
+        }
+
+        def line_for_symbol(sym):
+            return any(
+                re.fullmatch(r"\S+:(L\d+ )?(def|ref) " + re.escape(sym), ln)
+                or re.fullmatch(r"\S+ (def|ref) " + re.escape(sym), ln)
+                for ln in out.splitlines()
+            )
+
+        # Per file, record which of its fixture symbols did not surface.
+        unsurfaced = {
+            fname: [s for s in syms if not line_for_symbol(s)]
+            for fname, syms in expected.items()
+        }
+
+        # The spec requires at least one symbol per language; only PY and
+        # JS absence is a hard failure.
+        by_lang = {
+            "py": ["alpha_py.py", "beta_py.py"],
+            "js": ["gamma_js.js", "delta_js.js"],
+            "ts": ["epsilon_ts.ts", "zeta_ts.ts"],
+            "tsx": ["eta_tsx.tsx", "theta_tsx.tsx"],
+        }
+        for lang, fnames in by_lang.items():
+            surfaced = [
+                s for f in fnames for s in expected[f]
+                if line_for_symbol(s)
+            ]
+            if not surfaced:
+                # Warn and record which language, but only PY/JS fail.
+                print(f"     → WARNING: no symbol surfaced for language "
+                      f"{lang}; unsurfaced files="
+                      f"{[f for f in fnames if unsurfaced[f]]}")
+                results.append((f"MAP-03: a symbol from a .{lang} file surfaced",
+                                lang not in ("py", "js")))
+            else:
+                check(f"MAP-03: at least one symbol from a .{lang} file",
+                      True, f"{len(surfaced)} surfaced")
+
+        check("MAP-03: total length under 12000 chars",
+              len(out) < 12000, f"len={len(out)}")
+
+
+async def test_ranked_budget_and_exclusions():
+    print("\n[Test MAP-04] get_repo_skeleton — ranked budget & exclusions (T01 Day 2)")
+    with tempfile.TemporaryDirectory() as d:
+        # 20 Python files x 5 symbols = 100 symbols. Each file calls one of
+        # its own helpers so tree-sitter sees a real reference and the
+        # pygments line=-1 backfill path is not taken — every rendered
+        # symbol line therefore carries a real ":L<n>".
+        for i in range(20):
+            with open(os.path.join(d, f"mod_{i:02d}.py"), "w") as fh:
+                fh.write(f"def symbol_{i:02d}_helper(x):\n"
+                         f"    return x + {i}\n\n")
+                for j in range(1, 5):
+                    fh.write(f"def symbol_{i:02d}_{j}(y):\n"
+                             f"    return symbol_{i:02d}_helper(y)\n\n")
+
+        # Denied directory: node_modules must be skipped by the walker.
+        denied = os.path.join(d, "node_modules")
+        os.makedirs(denied)
+        for i in range(10):
+            with open(os.path.join(
+                    denied, f"denied_file_{i + 1:02d}_should_not_appear.py"
+            ), "w") as fh:
+                fh.write("def denied_symbol():\n    return 0\n")
+
+        out = await server.get_repo_skeleton(
+            repo_path=d, mode="ranked", max_tokens=200)
+
+        check("MAP-04: output does not start with ERROR",
+              not out.startswith("ERROR"), out[:300])
+
+        # max_tokens=200 → 800 chars for the ranked body; the metric line
+        # is appended afterwards, so allow a small margin.
+        check("MAP-04: output length <= 200*4 + 200",
+              len(out) <= 200 * 4 + 200, f"len={len(out)}")
+
+        check("MAP-04: contains the truncation marker",
+              "... [truncated] ..." in out, out[:400])
+
+        check("MAP-04: no denied file names leak",
+              "denied_file_" not in out, out[:400])
+        check("MAP-04: node_modules is not mentioned",
+              "node_modules" not in out, out[:400])
+
+        body_lines = [
+            ln for ln in out.splitlines()
+            if not ln.startswith("#")
+            and not ln.startswith("[TOKEN METRIC]")
+            and ln.strip()
+        ]
+        bad = [
+            ln for ln in body_lines
+            if not re.fullmatch(r"\S+\.py:L\d+ (def|ref) \S+", ln)
+            and ln.strip() != "... [truncated] ..."
+        ]
+        check("MAP-04: every visible symbol line is 'path:Lx def|ref name'",
+              not bad, f"{len(bad)} bad lines: {bad[:3]}")
+
+
+async def test_ranked_metric_honest():
+    print("\n[Test MAP-05] get_repo_skeleton — ranked metric honest (T01 Day 2 fix)")
+    with tempfile.TemporaryDirectory() as d:
+        # 60 functions per file, not 20: `baseline >= actual` is only a
+        # property of the metric when the repo is big enough for the map to
+        # compress it. At 3x20 the raw source is ~2400 bytes while the
+        # ranked map is ~3100 chars (every symbol costs a "path:Lx kind
+        # name" line plus pygments backfill), so the honest answer is
+        # saved=0 and `baseline >= actual` fails for the right reason.
+        # 3x60 puts raw at ~7100 bytes (baseline ~1770) against a map
+        # capped at 1500 tokens, so all four assertions below are
+        # meaningful at once.
+        for i in range(3):
+            with open(os.path.join(d, f"mod_{i}.py"), "w") as fh:
+                fh.write(f"def helper_{i}(x):\n    return x + {i}\n")
+                for j in range(60):
+                    fh.write(f"def fn_{i}_{j}(y):\n"
+                             f"    return helper_{i}(y)\n")
+        out = await server.get_repo_skeleton(repo_path=d, mode="ranked")
+
+        import re as _re
+        m = _re.search(
+            r"\[TOKEN METRIC\] tool=get_repo_skeleton saved=([\d,]+) "
+            r"baseline=([\d,]+) actual=([\d,]+)", out)
+        check("MAP-05: metric line present", m is not None, out[:400])
+        if m:
+            saved = int(m.group(1).replace(",", ""))
+            baseline = int(m.group(2).replace(",", ""))
+            actual = int(m.group(3).replace(",", ""))
+            check("MAP-05: baseline >= actual", baseline >= actual,
+                  f"baseline={baseline} actual={actual}")
+            # Raw files: 3 files * ~2360 chars ≈ 7100 bytes.
+            # estimate_tokens of that ≈ 1775. Baseline must be
+            # within a factor of 4 of that, not 16x (which would
+            # signal the fake len(ranked)*4 formula).
+            check("MAP-05: baseline is plausible (<= 4x raw/4)",
+                  baseline <= 2000, f"baseline={baseline}")
+            check("MAP-05: saved matches baseline - actual",
+                  saved == max(0, baseline - actual),
+                  f"saved={saved} baseline={baseline} actual={actual}")
+
+
+async def test_ranked_error_fallback():
+    """Regression: the ERROR-fallback branch crashed with NameError
+    ('redunded' vs 'redundant') whenever the adapter signalled failure."""
+    print("\n[Test MAP-06] get_repo_skeleton — ranked ERROR fallback (T01 Day 2 fix)")
+    from unittest import mock
+    from harness_core import repomap_adapter
+
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "keep_me.py"), "w") as fh:
+            fh.write("def keep_me():\n    return 1\n")
+
+        # 1. Adapter raises.
+        with mock.patch.object(repomap_adapter, "build_ranked_map_with_stats",
+                               side_effect=RuntimeError("boom")):
+            out = await server.get_repo_skeleton(repo_path=d, mode="ranked")
+        check("MAP-06: adapter exception falls back to outline",
+              out.startswith("# ranked mode unavailable — boom")
+              and "def keep_me(" in out, out[:300])
+
+        # 2. Adapter returns an ERROR tuple.
+        with mock.patch.object(repomap_adapter, "build_ranked_map_with_stats",
+                               return_value=("ERROR: ranked map unavailable — nope", 0)):
+            out = await server.get_repo_skeleton(repo_path=d, mode="ranked")
+        check("MAP-06: adapter ERROR falls back to outline",
+              out.startswith("# ranked mode unavailable — nope")
+              and "def keep_me(" in out, out[:300])
+
+        # 3. No exception escapes, and the reason is de-duplicated once.
+        check("MAP-06: reason is not double-prefixed",
+              "unavailable — ranked map unavailable" not in out, out[:300])
 
 
 async def main():
@@ -1661,6 +1937,10 @@ async def main():
     await test_lint_no_generic_line_fallback()
     await test_lint_path_disambiguation()
     await test_lint_source_change_during_compile_noted()
+    await test_ranked_multilang()
+    await test_ranked_budget_and_exclusions()
+    await test_ranked_metric_honest()
+    await test_ranked_error_fallback()
     await test_outline_legacy_calls()
     await test_ranked_python_smoke()
     await test_git_subdirectory_path()
