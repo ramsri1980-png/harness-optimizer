@@ -2076,8 +2076,11 @@ async def test_rollback_truncation_keeps_lines():
         r = await server.rollback_show(d)
         check("Response <= 4000", len(r) <= 4000, f"len={len(r)}")
         rlines = r.split("\n")
+        # A6: rollback_show's marker now carries the omitted-entry
+        # count ("... [truncated: N entries omitted] ..."); accept both
+        # that format and the plain one.
         check("Marker appears on its own line",
-              any(ln.strip() == "... [truncated] ..." for ln in rlines),
+              any(ln.strip().startswith("... [truncated") for ln in rlines),
               str([ln for ln in rlines if "truncated" in ln][:3]))
         listed = [ln for ln in rlines if ln.startswith("  untracked_file")]
         check("Whole entries survived truncation", len(listed) > 0,
@@ -2272,6 +2275,34 @@ async def test_db_readonly_connection_enforced():
         conn.close()
         check("No new tables appeared", names == ["users"], str(names))
 
+        # A5: actively attempt a write over the SAME uri-based
+        # connection the tool uses (mode=ro, uri=True) — it must fail.
+        import urllib.parse
+        uri = ("file:"
+               + urllib.parse.quote(os.path.abspath(db_path), safe="/")
+               + "?mode=ro")
+        probe = sqlite3.connect(uri, uri=True, timeout=5)
+        refused = False
+        err = ""
+        try:
+            probe.execute("CREATE TABLE _write_probe (x INTEGER)")
+            probe.commit()
+        except sqlite3.OperationalError as exc:
+            refused = True
+            err = str(exc)
+        finally:
+            probe.close()
+        check("Active write attempt raises OperationalError", refused, err)
+        check("Error says the database is readonly",
+              refused and "readonly database" in err.lower(), err)
+
+        conn = sqlite3.connect(db_path)
+        names = [row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+        conn.close()
+        check("Write probe left no table behind", "_write_probe" not in names,
+              str(names))
+
 
 async def test_db_selected_schema_and_identifiers():
     print("\n[Test DB-03] inspect_database_schema — tables= filter + identifiers (T09)")
@@ -2387,6 +2418,235 @@ async def test_db_error_closes_and_preserves():
               before.st_mtime_ns == after.st_mtime_ns)
 
 
+async def test_db_sqlite_underscore_wildcard():
+    print("\n[Test DB-08] inspect_database_schema — literal 'sqlite_' prefix (A1)")
+    with tempfile.TemporaryDirectory() as d:
+        db_path = os.path.join(d, "wildcard.sqlite")
+        conn = sqlite3.connect(db_path)
+        # SQLite refuses CREATE for names starting with "sqlite_", so
+        # the reserved-prefix row is injected the way a legacy DB could
+        # contain it; `sqliteXfoo` is a plain user table that the old
+        # `NOT LIKE 'sqlite_%'` clause wrongly hid ('_' matching 'X').
+        conn.execute("CREATE TABLE sqliteXfoo "
+                     "(id INTEGER PRIMARY KEY, v TEXT)")
+        conn.execute("PRAGMA writable_schema=ON")
+        conn.execute(
+            "INSERT INTO sqlite_master (type,name,tbl_name,rootpage,sql) "
+            "VALUES ('table','sqlite_isfine','sqlite_isfine',0,"
+            "'CREATE TABLE sqlite_isfine (id INTEGER)')")
+        conn.execute("PRAGMA writable_schema=OFF")
+        conn.commit()
+        conn.close()
+
+        r = await server.inspect_database_schema(db_path)
+        check("Reserved 'sqlite_' table stays hidden",
+              "sqlite_isfine" not in r, r[:400])
+        check("'sqliteXfoo' is listed", "sqliteXfoo" in r, r[:400])
+        check("Its column is rendered", "v TEXT" in r, r[:400])
+
+
+async def test_db_comma_in_table_name():
+    print("\n[Test DB-09] inspect_database_schema — table name with a comma (A2)")
+    with tempfile.TemporaryDirectory() as d:
+        db_path = os.path.join(d, "comma.sqlite")
+        conn = sqlite3.connect(db_path)
+        conn.execute('CREATE TABLE "comma,name" '
+                     '(id INTEGER PRIMARY KEY, v TEXT)')
+        conn.execute("CREATE TABLE other (id INTEGER PRIMARY KEY)")
+        conn.commit()
+        conn.close()
+
+        r = await server.inspect_database_schema(db_path, tables="comma,name")
+        check("Table whose name contains a comma is selectable",
+              "## comma,name" in r, r[:400])
+        check("Its column is rendered", "- v TEXT" in r, r[:400])
+        check("Header reports 1 of 2 tables",
+              "# schema — 1 of 2 tables" in r, r[:400])
+        check("Unrequested table omitted", "## other" not in r, r[:400])
+
+        # Without an exact match the input still comma-splits: the
+        # whole string isn't a table name, so the pieces are matched.
+        r2 = await server.inspect_database_schema(
+            db_path, tables="comma,name,other")
+        check("Comma-split fallback still selects exact names",
+              "## other" in r2, r2[:400])
+        check("Unmatched pieces are disclosed as not found",
+              "# requested table not found: comma" in r2, r2[:400])
+
+
+async def test_db_oversized_table_counts():
+    print("\n[Test DB-10] inspect_database_schema — inspected vs displayed (A3)")
+    with tempfile.TemporaryDirectory() as d:
+        db_path = os.path.join(d, "huge.sqlite")
+        conn = sqlite3.connect(db_path)
+        cols = ", ".join(f"column_with_a_long_name_{i:03d} TEXT"
+                         for i in range(200))
+        conn.execute(f"CREATE TABLE big_table "
+                     f"(id INTEGER PRIMARY KEY, {cols})")
+        conn.commit()
+        conn.close()
+
+        r = await server.inspect_database_schema(db_path)
+        blocks = re.findall(r"(?m)^## ", r)
+        check("Response ≤ 4000 chars", len(r) <= 4000, f"len={len(r)}")
+        if blocks:
+            m = re.search(r"(?m)^# schema — (\d+) of (\d+) tables$", r)
+            check("Header count matches the '## ' blocks shown",
+                  m is not None and int(m.group(1)) == len(blocks), r[:300])
+            check("No size-omission claim when nothing was dropped",
+                  "omitted by size" not in r, r[:300])
+        else:
+            check("Cut table is not claimed as complete",
+                  "1 of 1" not in r, r[:400])
+            check("Omission note names the dropped table count",
+                  "# ... [truncated: 1 tables omitted by size]" in r, r[:400])
+
+
+async def test_db_generated_columns():
+    print("\n[Test DB-11] inspect_database_schema — generated columns (A4)")
+    with tempfile.TemporaryDirectory() as d:
+        db_path = os.path.join(d, "generated.sqlite")
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE t ("
+                     "a TEXT, "
+                     "b TEXT, "
+                     "c TEXT GENERATED ALWAYS AS (a || b) VIRTUAL)")
+        conn.commit()
+        conn.close()
+
+        r = await server.inspect_database_schema(db_path)
+        check("Generated column listed with GENERATED marker",
+              "c TEXT GENERATED" in r, r[:400])
+        check("Ordinary columns listed too",
+              "a TEXT" in r and "b TEXT" in r, r[:400])
+        check("Response ≤ 4000 chars", len(r) <= 4000, f"len={len(r)}")
+
+
+async def test_rollback_omission_count():
+    print("\n[Test ROLL-08] rollback_show — omitted-entry count + wording (A6)")
+    with tempfile.TemporaryDirectory() as d:
+        subprocess.run(["git", "init", "-q"], cwd=d, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"],
+                       cwd=d, check=True)
+        subprocess.run(["git", "config", "user.name", "T"],
+                       cwd=d, check=True)
+        for i in range(150):
+            name = f"untracked_entry_{i:03d}_" + "y" * 60 + ".txt"
+            with open(os.path.join(d, name), "w") as fh:
+                fh.write("x\n")
+
+        r = await server.rollback_show(d)
+        check("Response ≤ 4000 chars", len(r) <= 4000, f"len={len(r)}")
+        check("ROLL-08: marker reports omitted entry count",
+              "entries omitted" in r, r[:500])
+        check("ROLL-08: real count, not a placeholder",
+              re.search(r"truncated: \d+ entries omitted", r) is not None,
+              r[:500])
+        check("ROLL-08: stash wording present",
+              "existing stashes are preserved" in r, r[:500])
+        check("ROLL-08: old imprecise caption is gone",
+              "loses everything shown above" not in r, r[:500])
+
+
+async def test_exec_silent_exit_codes():
+    print("\n[Test EXEC-08] execute_and_capture — silent success vs failure")
+    ok = await server.execute_and_capture('python3 -c "pass"')
+    check("EXEC-08: exit 0 reported", "Exit code: 0" in ok, ok[:200])
+    check("EXEC-08: not timed out", "Timed out: no" in ok, ok[:200])
+    check("EXEC-08: nothing truncated", "Output truncated: no" in ok, ok[:300])
+    check("EXEC-08: status flags all present",
+          all(s in ok for s in ("Exit code:", "Timed out:", "Output truncated:")),
+          ok[:300])
+
+    bad = await server.execute_and_capture(
+        'python3 -c "import sys; sys.exit(7)"')
+    check("EXEC-08: exit 7 reported", "Exit code: 7" in bad, bad[:200])
+    payload = bad.split("Relevant output:\n", 1)[-1]
+    check("EXEC-08: silent failure stays silent", payload.strip() == "",
+          repr(payload))
+    check("EXEC-08: not timed out on failure", "Timed out: no" in bad, bad[:200])
+
+
+async def test_exec_oversized_output_bounded():
+    print("\n[Test EXEC-09] execute_and_capture — oversized output bounded")
+    out = await server.execute_and_capture('python3 -c "print(\'z\' * 250000)"')
+    check("EXEC-09: Output truncated: yes", "Output truncated: yes" in out,
+          out[:200])
+    check("EXEC-09: 'bytes omitted' note present", "bytes omitted" in out,
+          out[:400])
+    check("EXEC-09: note carries real counts",
+          re.search(r"output truncated to \d+ bytes; \d+ bytes omitted", out)
+          is not None, out[:400])
+    check("EXEC-09: response bounded", len(out) < 220_000, f"len={len(out)}")
+    check("EXEC-09: exit code intact", "Exit code: 0" in out, out[:200])
+    check("EXEC-09: payload kept under the char cap",
+          out.count("z") <= server.MAX_OUTPUT_CHARS, f"count={out.count('z')}")
+
+
+async def test_exec_timeout_keeps_partial_output():
+    print("\n[Test EXEC-10] execute_and_capture — timeout keeps partial output")
+    out = await server.execute_and_capture(
+        "python3 -c \"print('partial'); import time; time.sleep(30)\"",
+        timeout_seconds=1)
+    check("EXEC-10: partial output survived", "partial" in out, out[:400])
+    check("EXEC-10: Timed out: yes", "Timed out: yes" in out, out[:300])
+    check("EXEC-10: Exit code: -1", "Exit code: -1" in out, out[:200])
+    check("EXEC-10: truncated flag still explicit",
+          "Output truncated:" in out, out[:300])
+    check("EXEC-10: bounded response", len(out) < 220_000, f"len={len(out)}")
+
+
+async def test_exec_log_path():
+    print("\n[Test EXEC-11] execute_and_capture — log_path full retention")
+    with tempfile.TemporaryDirectory() as d:
+        log = os.path.join(d, "captured.log")
+        out = await server.execute_and_capture(
+            'python3 -c "print(\'q\' * 250000)"', log_path=log)
+        check("EXEC-11: capped view returned", len(out) < 220_000,
+              f"len={len(out)}")
+        check("EXEC-11: view marked truncated",
+              "Output truncated: yes" in out, out[:300])
+        with open(log, "rb") as fh:
+            blob = fh.read()
+        check("EXEC-11: log holds the full output",
+              blob == b"q" * 250000 + b"\n", f"len={len(blob)}")
+
+        out2 = await server.execute_and_capture(
+            'python3 -c "print(\'w\' * 10)"', log_path=log)
+        with open(log, "rb") as fh:
+            blob2 = fh.read()
+        check("EXEC-11: log appends rather than overwrites",
+              blob2.startswith(b"q" * 250000) and b"w" * 10 in blob2,
+              f"len={len(blob2)}")
+        check("EXEC-11: second call still reports exit 0",
+              "Exit code: 0" in out2, out2[:200])
+
+        before = sorted(os.listdir(d))
+        await server.execute_and_capture("ls")
+        check("EXEC-11: no file written when log_path is empty",
+              sorted(os.listdir(d)) == before, str(os.listdir(d)))
+
+
+async def test_exec_allowlist_unchanged():
+    print("\n[Test EXEC-12] execute_and_capture — allowlist + bypass guard")
+    expected = {"pytest", "python3", "python", "git", "ls", "cat", "grep",
+                "rg", "find"}
+    check("EXEC-12: allowlist unchanged",
+          server.ALLOWED_COMMANDS == expected,
+          str(sorted(server.ALLOWED_COMMANDS)))
+
+    rm = await server.execute_and_capture("rm -rf /")
+    check("EXEC-12: 'rm -rf /' refused", rm.startswith("ERROR:"), rm[:200])
+    check("EXEC-12: refusal lists allowed commands",
+          "Allowed:" in rm, rm[:200])
+
+    wr = await server.execute_and_capture(
+        'python3 -c "open(\'/tmp/x\',\'w\')"')
+    check("EXEC-12: python write refused", wr.startswith("ERROR:"), wr[:200])
+    check("EXEC-12: refusal comes from the bypass guard",
+          "refused" in wr and "dangerous pattern" in wr, wr[:300])
+
+
 async def main():
     print("=" * 60)
     print("Harness-Optimizer Fix Verification")
@@ -2491,6 +2751,16 @@ async def main():
     await test_db_many_tables_truncated()
     await test_db_wal_and_sidecar()
     await test_db_error_closes_and_preserves()
+    await test_db_sqlite_underscore_wildcard()
+    await test_db_comma_in_table_name()
+    await test_db_oversized_table_counts()
+    await test_db_generated_columns()
+    await test_rollback_omission_count()
+    await test_exec_silent_exit_codes()
+    await test_exec_oversized_output_bounded()
+    await test_exec_timeout_keeps_partial_output()
+    await test_exec_log_path()
+    await test_exec_allowlist_unchanged()
 
 
     print("\n" + "=" * 60)

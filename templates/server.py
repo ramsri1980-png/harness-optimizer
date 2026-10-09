@@ -1081,21 +1081,34 @@ def _git_detail(err: str) -> str:
     return err.splitlines()[0] if err else "unknown"
 
 
-def _truncate_middle(text: str, limit: int) -> str:
+def _truncate_middle(text: str, limit: int,
+                     count_label: str = None) -> str:
     """Elide the middle of *text* so the result fits in *limit* chars.
 
     Truncation is entry-based: whole lines are kept or dropped, so a
     path (or any other entry) is never sliced in half — an omitted
     entry is dropped outright instead of being rendered as a partial
     one. The head and the tail of the text both survive, and the
-    marker always lands on its own line."""
+    marker always lands on its own line.
+
+    With the default `count_label=None` the marker is exactly
+    `... [truncated] ...`. When a label is given (e.g. "entries") the
+    marker also reports how many lines the head/tail selection dropped:
+    `... [truncated: N entries omitted] ...`. The budget is reserved
+    with the worst-case (largest) count first, so the real marker can
+    only be shorter than the space reserved for it."""
     if len(text) <= limit:
         return text
-    marker = "\n... [truncated] ...\n"
+    lines = text.splitlines(keepends=True)
+    if count_label is None:
+        marker = "\n... [truncated] ...\n"
+    else:
+        # Placeholder count: at most every line can be omitted.
+        marker = (f"\n... [truncated: {len(lines)} {count_label} "
+                  f"omitted] ...\n")
     if limit <= len(marker):
         return text[:limit]
     budget = limit - len(marker)
-    lines = text.splitlines(keepends=True)
     head_lines = []
     head_used = 0
     for ln in lines:
@@ -1110,6 +1123,10 @@ def _truncate_middle(text: str, limit: int) -> str:
             break
         tail_lines.insert(0, ln)
         tail_used += len(ln)
+    if count_label is not None:
+        omitted = len(lines) - len(head_lines) - len(tail_lines)
+        marker = (f"\n... [truncated: {omitted} {count_label} "
+                  f"omitted] ...\n")
     result = "".join(head_lines) + marker + "".join(tail_lines)
     if len(result) > limit:
         result = result[:limit]
@@ -1294,7 +1311,8 @@ async def rollback_show(repo_path: str) -> str:
             "⚠️  Review the above. Rollback is manual — copy a command below and run",
             "   it yourself in your terminal. This tool does not execute rollback.",
             "",
-            "Full rollback (loses everything shown above):",
+            "Full rollback (loses the staged, unstaged, and untracked "
+            "changes shown above; existing stashes are preserved):",
             "    git reset --hard HEAD && git clean -fd",
             "",
             "Undo tracked-file edits only (keeps untracked files):",
@@ -1304,7 +1322,8 @@ async def rollback_show(repo_path: str) -> str:
             "    git stash push -u -m 'harness rollback'",
         ]
         # ── T07-6: bounded response; header and manual commands survive ──
-        return _truncate_middle("\n".join(r), 4000)
+        # A6: the marker reports how many entries the cap dropped.
+        return _truncate_middle("\n".join(r), 4000, count_label="entries")
     except Exception as exc:
         return f"ERROR: rollback inspection failed — {exc}"
 
@@ -1352,75 +1371,187 @@ def _bypass_reason(parts: list):
     return None
 
 @register("execute_and_capture")
-async def execute_and_capture(command: str, timeout_seconds: int = 15):
+async def execute_and_capture(command: str, timeout_seconds: int = 15,
+                              log_path: str = "") -> str:
+    """Run a whitelisted command with bounded, streaming capture.
+
+    stdout and stderr are read in 4 KiB chunks into a shared byte
+    budget of MAX_OUTPUT_CHARS * 4 (four bytes per character of UTF-8
+    headroom). Once the budget is spent the streams keep being drained
+    but are no longer stored, so the child never blocks on a full pipe.
+    Partial output survives a timeout, and an optional `log_path`
+    receives the full, uncapped stream while the response stays
+    bounded."""
     import shlex
+    import signal
     import subprocess
+    import threading
     parts = shlex.split(command)
     if not parts or parts[0] not in ALLOWED_COMMANDS:
         return f"ERROR: Command '{parts[0] if parts else ''}' is not allowed. Allowed: {', '.join(ALLOWED_COMMANDS)}"
-    
+
     reason = _bypass_reason(parts)
     if reason:
         return f"ERROR: {reason}"
-    
+
+    # ── B1: bounded streaming capture ──
+    byte_cap = MAX_OUTPUT_CHARS * 4
+    buckets = {"out": bytearray(), "err": bytearray()}
+    used = 0
+    read_total = 0
+    cap_hit = False
+    lock = threading.Lock()
+
+    log_fh = None
+    if log_path:
+        try:
+            log_fh = open(log_path, "ab")
+        except OSError as exc:
+            return f"ERROR: cannot open log_path — {exc}"
+
+    def pump(stream, key):
+        """Drain one pipe: store up to the shared byte budget, keep
+        draining past it, and mirror everything to the log file."""
+        nonlocal used, read_total, cap_hit
+        try:
+            fd = stream.fileno()
+        except (OSError, ValueError):
+            return
+        while True:
+            try:
+                chunk = os.read(fd, 4096)
+            except (OSError, ValueError):
+                break
+            if not chunk:
+                break
+            if log_fh is not None:
+                try:
+                    with lock:
+                        log_fh.write(chunk)
+                except (OSError, ValueError):
+                    pass
+            with lock:
+                read_total += len(chunk)
+                room = byte_cap - used
+                if room > 0:
+                    take = chunk[:room]
+                    buckets[key].extend(take)
+                    used += len(take)
+                if len(chunk) > room:
+                    cap_hit = True
+
     try:
-        result = subprocess.run(
-            parts,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            shell=False
-        )
-        output = result.stdout + "\n" + result.stderr
-        raw_len = len(output)
-        lines = output.splitlines()
-        over_lines = len(lines) > MAX_OUTPUT_LINES
-        over_chars = raw_len > MAX_OUTPUT_CHARS
+        proc = subprocess.Popen(parts, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=False,
+                                shell=False, cwd=None)
+    except OSError as exc:
+        if log_fh is not None:
+            log_fh.close()
+        return f"ERROR: could not run '{parts[0]}' — {exc}"
 
-        # Apply limits cumulatively: trim lines first, then apply char cap.
-        # Metadata notes are collected BEFORE the payload so they survive
-        # any downstream char truncation.
-        kept = output
-        limit_notes = []
+    readers = [
+        threading.Thread(target=pump, args=(proc.stdout, "out"), daemon=True),
+        threading.Thread(target=pump, args=(proc.stderr, "err"), daemon=True),
+    ]
+    for t in readers:
+        t.start()
 
-        if over_lines:
-            kept = "\n".join(
-                lines[: MAX_OUTPUT_LINES // 2]
-                + [f"... [ LOGS CLIPPED: line limit reached ({len(lines)} lines > {MAX_OUTPUT_LINES}) ] ..."]
-                + lines[-(MAX_OUTPUT_LINES // 2):]
-            )
-            limit_notes.append(f"line limit reached ({len(lines)} lines > {MAX_OUTPUT_LINES})")
-
-        if len(kept) > MAX_OUTPUT_CHARS:
-            half = MAX_OUTPUT_CHARS // 2
-            dropped = len(kept) - MAX_OUTPUT_CHARS
-            kept = (
-                kept[:half]
-                + f"\n... [ CLIPPED: {dropped} chars dropped to stay under {MAX_OUTPUT_CHARS} ] ...\n"
-                + kept[-half:]
-            )
-            limit_notes.append(f"{dropped} chars dropped to stay under {MAX_OUTPUT_CHARS}")
-
-        response = [
-            f"Exit code: {result.returncode}",
-            f"Timed out: no",
-            f"Output truncated: {'yes' if limit_notes else 'no'}",
-        ]
-        if limit_notes:
-            response.append("Applied limits: " + "; ".join(limit_notes))
-        response.append("Relevant output:\n" + kept)
-
-        return "\n".join(response)
-        return "\n".join(response)
-
+    # ── B2: partial output must survive a timeout ──
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
-        return (
-            "Exit code: -1\n"
-            "Timed out: yes\n"
-            "Output truncated: no\n"
-            "Relevant output:\n"
-            f"Command timed out after {timeout_seconds} seconds."
+        timed_out = True
+        # Interrupt first: a Python child then raises KeyboardInterrupt,
+        # which flushes its buffered stdout on the way out. Escalate to
+        # SIGKILL only if the child ignores the interrupt.
+        try:
+            proc.send_signal(signal.SIGINT)
+            proc.wait(timeout=1.0)
+        except (subprocess.TimeoutExpired, OSError):
+            try:
+                proc.kill()
+                proc.wait(timeout=5.0)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+
+    for t in readers:
+        t.join(timeout=10)
+    if log_fh is not None:
+        log_fh.close()
+    if not any(t.is_alive() for t in readers):
+        for stream in (proc.stdout, proc.stderr):
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
+
+    with lock:
+        stdout_bytes = bytes(buckets["out"])
+        stderr_bytes = bytes(buckets["err"])
+        dropped_bytes = read_total - used
+
+    output = (stdout_bytes.decode("utf-8", errors="replace")
+              + "\n"
+              + stderr_bytes.decode("utf-8", errors="replace"))
+    lines = output.splitlines()
+    over_lines = len(lines) > MAX_OUTPUT_LINES
+
+    # Apply limits cumulatively: trim lines first, then apply char cap.
+    # Metadata notes are collected BEFORE the payload so they survive
+    # any downstream char truncation.
+    kept = output
+    limit_notes = []
+
+    if over_lines:
+        half = MAX_OUTPUT_LINES // 2
+        dropped_bytes += sum(
+            len(ln.encode("utf-8", "replace")) + 1
+            for ln in lines[half:len(lines) - half]
         )
+        kept = "\n".join(
+            lines[:half]
+            + [f"... [ LOGS CLIPPED: line limit reached ({len(lines)} lines > {MAX_OUTPUT_LINES}) ] ..."]
+            + lines[-half:]
+        )
+        limit_notes.append(f"line limit reached ({len(lines)} lines > {MAX_OUTPUT_LINES})")
+
+    if len(kept) > MAX_OUTPUT_CHARS:
+        half = MAX_OUTPUT_CHARS // 2
+        dropped = len(kept) - MAX_OUTPUT_CHARS
+        dropped_bytes += len(
+            kept[half:len(kept) - half].encode("utf-8", "replace")
+        )
+        kept = (
+            kept[:half]
+            + f"\n... [ CLIPPED: {dropped} chars dropped to stay under {MAX_OUTPUT_CHARS} ] ...\n"
+            + kept[-half:]
+        )
+        limit_notes.append(f"{dropped} chars dropped to stay under {MAX_OUTPUT_CHARS}")
+
+    # ── B3: explicit status flags, always present ──
+    truncated = cap_hit or bool(limit_notes)
+    response = [
+        f"Exit code: {-1 if timed_out else proc.returncode}",
+        f"Timed out: {'yes' if timed_out else 'no'}",
+        f"Output truncated: {'yes' if truncated else 'no'}",
+    ]
+    if truncated:
+        response.append(
+            f"(output truncated to "
+            f"{len(kept.encode('utf-8', 'replace'))} bytes; "
+            f"{dropped_bytes} bytes omitted)"
+        )
+    if timed_out:
+        response.append(
+            f"Command timed out after {timeout_seconds} seconds; "
+            "output below is partial."
+        )
+    if limit_notes:
+        response.append("Applied limits: " + "; ".join(limit_notes))
+    response.append("Relevant output:\n" + kept)
+
+    return "\n".join(response)
 
 _DB_MAX_TABLES = 50
 _DB_MAX_CHARS = 4000
@@ -1460,9 +1591,12 @@ async def inspect_database_schema(db_path: str, tables: str = "") -> str:
     try:
         try:
             cur = conn.cursor()
+            # LIKE treats '_' as a single-character wildcard, so
+            # `NOT LIKE 'sqlite_%'` would also hide valid user tables
+            # such as `sqliteXfoo`. Compare the literal prefix instead.
             cur.execute(
                 "SELECT name FROM sqlite_master "
-                "WHERE type='table' AND name NOT LIKE 'sqlite_%' "
+                "WHERE type='table' AND substr(lower(name), 1, 7) != 'sqlite_' "
                 "ORDER BY name"
             )
             all_tables = [r[0] for r in cur.fetchall()]
@@ -1471,7 +1605,14 @@ async def inspect_database_schema(db_path: str, tables: str = "") -> str:
 
         notes: list[str] = []
         pool = all_tables
-        wanted = [t.strip() for t in tables.split(",") if t.strip()]
+        # A table may legitimately contain commas in its name, so the
+        # whole trimmed input is first checked for an exact table match
+        # before falling back to the comma-separated interpretation.
+        raw_wanted = tables.strip()
+        if raw_wanted and raw_wanted in all_tables:
+            wanted = [raw_wanted]
+        else:
+            wanted = [t.strip() for t in tables.split(",") if t.strip()]
         if wanted:
             wanted_set = set(wanted)
             pool = [t for t in all_tables if t in wanted_set]
@@ -1485,7 +1626,10 @@ async def inspect_database_schema(db_path: str, tables: str = "") -> str:
         blocks = []
         for table in selected:
             try:
-                cur.execute(f"PRAGMA table_info({_quote_ident(table)})")
+                # table_xinfo, not table_info: generated columns are
+                # invisible to table_info even though they are part of
+                # the schema.
+                cur.execute(f"PRAGMA table_xinfo({_quote_ident(table)})")
                 columns = cur.fetchall()
                 cur.execute(f"PRAGMA foreign_key_list({_quote_ident(table)})")
                 fks = cur.fetchall()
@@ -1495,12 +1639,19 @@ async def inspect_database_schema(db_path: str, tables: str = "") -> str:
                 return f"ERROR: cannot open database — {exc}"
 
             lines = [f"## {table}"]
-            for _cid, cname, ctype, notnull, _dflt, pk in columns:
+            for row in columns:
+                # (cid, name, type, notnull, dflt_value, pk, hidden)
+                _cid, cname, ctype, notnull, _dflt, pk = row[:6]
+                hidden = row[6] if len(row) > 6 else 0
+                if hidden not in (0, 2, 3):
+                    continue  # 1 = hidden column, never selected
                 line = f"  - {cname} {ctype}"
                 if pk:
                     line += " PK"
                 if notnull:
                     line += " NOT NULL"
+                if hidden in (2, 3):
+                    line += " GENERATED"
                 lines.append(line)
             for _id, _seq, fk_table, fk_from, fk_to, *_rest in fks:
                 lines.append(f"  FK {fk_from} -> {fk_table}.{fk_to}")
@@ -1519,16 +1670,62 @@ async def inspect_database_schema(db_path: str, tables: str = "") -> str:
                 )
             blocks.append("\n".join(lines))
 
-        head = [f"# schema — {len(selected)} of {len(all_tables)} tables"]
-        head.extend(notes)
-        text = "\n".join(head)
-        if blocks:
-            text += "\n\n" + "\n\n".join(blocks)
-        if omitted:
-            text += (
-                f"\n# ... [truncated: {omitted} tables omitted; "
-                "use tables= to select]"
+        # ── A3: inspected vs displayed ──
+        # `inspected_tables` are read from sqlite_master; a block is
+        # only shown whole, so `displayed_tables` counts the blocks that
+        # still fit the 4000-char budget. Whenever they differ, the
+        # header drops the "N of M tables" phrasing (which would imply
+        # complete coverage) and an omission note is appended.
+        inspected_tables = len(selected)
+        cap_note = (
+            f"# ... [truncated: {omitted} tables omitted; "
+            "use tables= to select]"
+            if omitted
+            else ""
+        )
+        size_note = ""
+        header = ""
+        text = ""
+        n_drop = len(blocks)
+        for _ in range(len(blocks) + 3):
+            displayed_tables = len(blocks) - n_drop
+            if displayed_tables < inspected_tables:
+                header = (
+                    f"# schema — {len(all_tables)} tables total; "
+                    f"{inspected_tables} inspected; "
+                    f"{displayed_tables} displayed"
+                )
+            else:
+                header = (
+                    f"# schema — {inspected_tables} of {len(all_tables)} tables"
+                )
+            prefix_text = "\n".join([header, *notes])
+            size_note = (
+                f"# ... [truncated: {n_drop} tables omitted by size]"
+                if n_drop
+                else ""
             )
+            tail_notes = [n for n in (cap_note, size_note) if n]
+            suffix = "\n".join(tail_notes)
+            suffix_len = (1 + len(suffix)) if suffix else 0
+            budget = _DB_MAX_CHARS - len(prefix_text) - suffix_len - 2
+            kept: list[str] = []
+            used = 0
+            for block in blocks:
+                add = len(block) + (2 if kept else 0)
+                if used + add > budget:
+                    continue
+                kept.append(block)
+                used += add
+            text = prefix_text
+            if kept:
+                text += "\n\n" + "\n\n".join(kept)
+            if suffix:
+                text += "\n" + suffix
+            new_drop = len(blocks) - len(kept)
+            if new_drop == n_drop:
+                break
+            n_drop = new_drop
         return _truncate_middle(text, _DB_MAX_CHARS)
     finally:
         conn.close()
