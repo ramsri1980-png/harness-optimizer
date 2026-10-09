@@ -2762,6 +2762,10 @@ async def main():
     await test_exec_log_path()
     await test_exec_allowlist_unchanged()
 
+    # CORE regression tests (tests/test_core.py) — counts toward the tally
+    import test_core
+    test_core.run()
+    results.extend(test_core.check_results)
 
     print("\n" + "=" * 60)
     passed = sum(1 for _, ok in results if ok)

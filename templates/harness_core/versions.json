@@ -1,0 +1,14 @@
+{
+  "harness_core_schema": 1,
+  "verified_environment": {
+    "opencode_binary": "2.0.24",
+    "opencode_plugin_types": "0.0.0-beta-19507",
+    "verified_at": "2026-10-09",
+    "verified_by": "CTX spike (docs/ctx-spike-findings.md)"
+  },
+  "notes": [
+    "Runtime does not require @opencode/plugin types; they are for dev-time typechecking only.",
+    "Re-run compatibility tests after any OpenCode upgrade.",
+    "Do not assume beta hooks are stable merely because TypeScript compiles."
+  ]
+}
