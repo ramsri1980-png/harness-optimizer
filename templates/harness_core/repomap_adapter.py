@@ -3,12 +3,14 @@ adds JavaScript, TypeScript and TSX).
 
 Public entry points
 -------------------
-``build_ranked_map(repo_path, task_hint="", max_tokens=1500)``
+``build_ranked_map(repo_path, task_hint="", max_tokens=1500, max_files=500)``
     Returns the ranked map as a string.
 
-``build_ranked_map_with_stats(repo_path, task_hint="", max_tokens=1500)``
+``build_ranked_map_with_stats(repo_path, task_hint="", max_tokens=1500,
+max_files=500)``
     Same map, but returns ``(text, raw_bytes)`` where ``raw_bytes`` is the
-    sum of ``os.path.getsize()`` for every walked source file.  Callers
+    sum of ``os.path.getsize()`` for every walked source file.  ``max_files``
+    caps the walk (the same 500 default as ``_MAX_FILES``).  Callers
     should use this to build an **honest** token baseline: the ranked text
     is a truncation of the raw sources, so the baseline must be derived
     from the bytes actually read, never from the output length.
@@ -51,11 +53,12 @@ Behaviour guarantees
 * Any exception is swallowed and reported as
   ``ERROR: ranked map unavailable — <exc>``.
 * ``build_ranked_map_with_stats`` keeps a small, bounded **in-process**
-  cache (no on-disk state) keyed by the walked files' freshness
+  cache (no on-disk state) keyed by the walked files' content-hash
   signature.  An unchanged tree is served from the cache; an added,
-  edited, deleted or touched file changes the signature and the map is
-  recomputed silently.  At most ``_CACHE_MAX`` roots are retained
-  (LRU eviction).
+  edited or deleted file changes the signature and the map is
+  recomputed silently (a metadata-only touch does not — the signature
+  hashes bytes, not timestamps).  At most ``_CACHE_MAX`` roots are
+  retained (LRU eviction).
 * The backend dependencies are checked by ``_preflight_backend()``
   before the walk, so a half-installed backend reports
   ``ERROR: ranked map unavailable — backend not installed: <module>``
@@ -64,6 +67,7 @@ Behaviour guarantees
   imports cleanly.
 """
 
+import hashlib
 import os
 import re
 import threading
@@ -128,23 +132,27 @@ def _source_files(root, limit=_MAX_FILES):
 
 def _signature(files, root):
     """Return a hashable signature of the walked source files:
-    sorted (relative_path, mtime_ns, size) tuples. mtime_ns alone is
-    not enough — a same-size, same-mtime write should still be caught
-    by size, and a same-size same-second edit is caught by ns
-    resolution on all supported filesystems.
+    sorted (relative_path, sha256_of_content) tuples.
+
+    The signature hashes file CONTENT rather than (mtime, size): a
+    same-size edit with a restored timestamp is invisible to stat-based
+    freshness, but changes the hash.  Reading bytes is dramatically
+    cheaper than parsing + ranking, so full content hashing is cheap
+    here.
 
     ``root`` is only used to render the relative paths (the cache key is
     the root itself, so the relative form is a cheap stability guard, not
     the freshness signal).  A file that vanishes between the walk and the
-    stat is skipped, exactly like ``_raw_bytes`` skips it.
+    read is skipped, exactly like ``_raw_bytes`` skips it.
     """
     rows = []
     for fname in files:
         try:
-            st = os.stat(fname)
+            with open(fname, "rb") as fh:
+                digest = hashlib.sha256(fh.read()).hexdigest()
         except OSError:
             continue
-        rows.append((os.path.relpath(fname, root), st.st_mtime_ns, st.st_size))
+        rows.append((os.path.relpath(fname, root), digest))
     return tuple(sorted(rows))
 
 
@@ -262,7 +270,8 @@ def _preflight_backend():
     return None
 
 
-def build_ranked_map_with_stats(repo_path, task_hint="", max_tokens=1500):
+def build_ranked_map_with_stats(repo_path, task_hint="", max_tokens=1500,
+                                max_files=_MAX_FILES):
     """Same as ``build_ranked_map`` but returns ``(text, raw_bytes)``
     where ``raw_bytes`` is the sum of ``os.path.getsize()`` for every
     source file that was walked.
@@ -270,6 +279,10 @@ def build_ranked_map_with_stats(repo_path, task_hint="", max_tokens=1500):
     ``raw_bytes`` lets the caller build an honest token baseline from the
     actual bytes read, instead of guessing from the (already truncated)
     output length.  On the error paths it is ``0``.
+
+    ``max_files`` caps how many source files the walk collects
+    (default ``_MAX_FILES`` = 500) and is part of the cache signature,
+    so differently-limited calls never share a cached rendering.
     """
     try:
         reason = _preflight_backend()
@@ -285,15 +298,15 @@ def build_ranked_map_with_stats(repo_path, task_hint="", max_tokens=1500):
         if not os.path.isdir(root):
             return f"ERROR: ranked map unavailable — not a directory: {root}", 0
 
-        files = _source_files(root)
+        files = _source_files(root, limit=int(max_files))
         if not files:
             return f"# ranked source map — 0 files, 0 symbols\n# {root}", 0
 
-        # Freshness signature: walk + stat only (cheap next to ranking).
-        # ``task_hint`` and ``max_tokens`` are part of the signature so a
-        # differently-parameterised call can never be served the wrong
-        # cached rendering.
-        sig = (_signature(files, root), task_hint, max_tokens)
+        # Freshness signature: walk + content hash only (cheap next to
+        # ranking).  ``task_hint``, ``max_tokens`` and ``max_files`` are
+        # part of the signature so a differently-parameterised call can
+        # never be served the wrong cached rendering.
+        sig = (_signature(files, root), task_hint, max_tokens, int(max_files))
 
         with _CACHE_LOCK:
             cached = _CACHE.get(root)
@@ -402,11 +415,13 @@ def build_ranked_map_with_stats(repo_path, task_hint="", max_tokens=1500):
         return f"ERROR: ranked map unavailable — {exc}", 0
 
 
-def build_ranked_map(repo_path, task_hint="", max_tokens=1500):
+def build_ranked_map(repo_path, task_hint="", max_tokens=1500,
+                     max_files=_MAX_FILES):
     """Return a bounded ranked map of source symbols in repo_path.
     Supports Python, JavaScript, TypeScript, and TSX.
     task_hint biases ranking when provided. Returns a string."""
-    text, _raw = build_ranked_map_with_stats(repo_path, task_hint, max_tokens)
+    text, _raw = build_ranked_map_with_stats(repo_path, task_hint, max_tokens,
+                                             max_files)
     return text
 
 

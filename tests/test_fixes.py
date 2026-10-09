@@ -6,6 +6,7 @@ import asyncio
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -1951,6 +1952,441 @@ async def test_ranked_backend_missing():
               "grep_ast" in out, out[:300])
 
 
+# ═══════════════════════════════════════════════════════════
+# 0.12.0 regression bundle — external-review fixes
+# ═══════════════════════════════════════════════════════════
+
+async def test_git_partial_stage_refused():
+    print("\n[Test GIT-07] git_checkpoint — partially-staged target refused (T06 fix)")
+    with tempfile.TemporaryDirectory() as d:
+        subprocess.run(["git", "init", "-q"], cwd=d, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=d, check=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=d, check=True)
+        target = os.path.join(d, "partial.py")
+        with open(target, "w") as fh:
+            fh.write("# v1\n")
+        subprocess.run(["git", "add", "."], cwd=d, check=True)
+        subprocess.run(["git", "commit", "-qm", "init"], cwd=d, check=True)
+        head_before = subprocess.run(["git", "rev-parse", "HEAD"], cwd=d,
+                                     capture_output=True, text=True).stdout
+
+        # Stage one edit, then edit the worktree again → status "MM":
+        # `git add` here would sweep the unstaged edit into our commit.
+        with open(target, "w") as fh:
+            fh.write("# staged edit\n")
+        subprocess.run(["git", "add", "partial.py"], cwd=d, check=True)
+        with open(target, "w") as fh:
+            fh.write("# staged edit\n# unstaged edit\n")
+
+        r = await server.git_checkpoint(target, "t06 partial stage")
+        head_after = subprocess.run(["git", "rev-parse", "HEAD"], cwd=d,
+                                    capture_output=True, text=True).stdout
+        status = subprocess.run(["git", "status", "--porcelain"], cwd=d,
+                                capture_output=True, text=True).stdout
+        check("Partially-staged target refused",
+              "both staged and unstaged changes" in r, r[:400])
+        check("Not reported as committed", "Committed:" not in r, r[:300])
+        check("HEAD unchanged", head_before == head_after,
+              f"{head_before!r} -> {head_after!r}")
+        check("git add did not sweep the unstaged edit",
+              "MM partial.py" in status, status[:300])
+        check("Unstaged edit still on disk",
+              "# unstaged edit" in open(target).read(),
+              open(target).read()[:200])
+
+        # Only unstaged changes: the old behaviour must survive.
+        subprocess.run(["git", "reset", "-q"], cwd=d, check=True)
+        with open(target, "w") as fh:
+            fh.write("# worktree only\n")
+        r2 = await server.git_checkpoint(target, "t06 unstaged only")
+        check("Unstaged-only target still commits",
+              "Committed:" in r2, r2[:300])
+
+
+async def test_edit_preserves_mixed_newlines():
+    print("\n[Test EDIT-07] apply_search_replace — mixed-newline byte preservation (T04 fix)")
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "mixed.py")
+        # CRLF is dominant (4 of 5 breaks) but one break is a lone LF.
+        original = b"alpha\r\nbeta\r\ngamma\r\nlonely\nlast\r\n"
+        with open(f, "wb") as fh:
+            fh.write(original)
+
+        # Multi-line block passed the conventional way (\n); it must be
+        # converted to the file's dominant newline to match, and only
+        # that byte range may change.
+        r = await server.apply_search_replace(f, "alpha\nbeta", "alpha1\nbeta1")
+        check("Multi-line edit applied",
+              "successfully" in r.lower() or "Surgical" in r, r[:300])
+        after = open(f, "rb").read()
+        check("Exactly the matched range changed",
+              after == b"alpha1\r\nbeta1\r\ngamma\r\nlonely\nlast\r\n",
+              str(after))
+        check("Minority LF break survived untouched",
+              b"lonely\nlast" in after, str(after))
+
+        # Single-line edit: every other byte still untouched.
+        r2 = await server.apply_search_replace(f, "gamma", "gamma2")
+        after2 = open(f, "rb").read()
+        check("Second edit applied",
+              "successfully" in r2.lower() or "Surgical" in r2, r2[:300])
+        check("No newline rewritten outside the range",
+              after2 == b"alpha1\r\nbeta1\r\ngamma2\r\nlonely\nlast\r\n",
+              str(after2))
+        check("CRLF convention still dominant in output",
+              after2.count(b"\r\n") == 4 and b"\n" in after2, str(after2))
+
+
+async def test_edit_rejects_overlapping_match():
+    print("\n[Test EDIT-08] apply_search_replace — overlapping matches rejected (T04 fix)")
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "overlap.py")
+        original = b"aaa\n"
+        with open(f, "wb") as fh:
+            fh.write(original)
+        # str.count("aa") over "aaa" is 1 (non-overlapping), so the old
+        # code accepted this and wrote. The overlapping scan finds
+        # positions 0 and 1 → 2 matches → must refuse.
+        r = await server.apply_search_replace(f, "aa", "b")
+        check("Overlapping match rejected", "ERROR" in r.upper(), r[:300])
+        check("Ambiguity reported with the overlapping count",
+              "matches 2 locations" in r, r[:300])
+        check("File left unchanged",
+              open(f, "rb").read() == original, str(open(f, "rb").read()))
+
+        # A single occurrence (even overlapping a longer neighbour) works.
+        r2 = await server.apply_search_replace(f, "aaa", "zzz")
+        check("Unique match still applies",
+              "successfully" in r2.lower() or "Surgical" in r2, r2[:300])
+        check("Replacement written", open(f, "rb").read() == b"zzz\n",
+              str(open(f, "rb").read()))
+
+
+async def test_rollback_truncation_keeps_lines():
+    print("\n[Test ROLL-07] rollback_show — entry-based truncation (T07 fix)")
+    with tempfile.TemporaryDirectory() as d:
+        subprocess.run(["git", "init", "-q"], cwd=d, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=d, check=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=d, check=True)
+        for i in range(80):
+            name = (f"untracked_file_with_a_really_long_name_{i:03d}_"
+                    + "x" * 70 + ".py")
+            with open(os.path.join(d, name), "w") as fh:
+                fh.write("# x\n")
+        r = await server.rollback_show(d)
+        check("Response <= 4000", len(r) <= 4000, f"len={len(r)}")
+        rlines = r.split("\n")
+        check("Marker appears on its own line",
+              any(ln.strip() == "... [truncated] ..." for ln in rlines),
+              str([ln for ln in rlines if "truncated" in ln][:3]))
+        listed = [ln for ln in rlines if ln.startswith("  untracked_file")]
+        check("Whole entries survived truncation", len(listed) > 0,
+              f"listed={len(listed)}")
+        broken = [ln for ln in listed if not ln.endswith(".py")]
+        check("No half-line entries", broken == [], str(broken[:3]))
+        check("Manual commands survive truncation",
+              "git reset --hard" in r, r[:400])
+
+
+async def test_read_fitting_never_overflows():
+    print("\n[Test READ-09] rip_file_lines — _fit_or_mark never exceeds budget (T02 fix)")
+    cases = [
+        # The old bug: `room` used the full budget although `out` had
+        # already consumed part of it → joined length 105 > 100.
+        (["1: aaa", "2: " + "x" * 5000], 100),
+        (["1: " + "y" * 5000], 100),
+        (["1: " + "a" * 60, "2: b", "3: " + "c" * 5000], 100),
+        ([f"{i}: line_{i}" for i in range(1, 200)], 500),
+        (["a", "b", "c"], 5),
+        (["a", "b"], 1),
+        (["x" * 50], 0),
+        (["1: " + "z" * 40], 60),
+        ([], 100),
+    ]
+    overflowing = []
+    for lines, budget in cases:
+        out = server._fit_or_mark(list(lines), budget)
+        joined = "\n".join(out)
+        if len(joined) > budget:
+            overflowing.append(f"budget={budget} got={len(joined)}")
+    check("Fitted output never exceeds the budget",
+          overflowing == [], str(overflowing))
+
+    # End-to-end: a huge single line still yields a bounded, marked view.
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "huge.py")
+        with open(f, "w") as fh:
+            fh.write("a\n")
+            fh.write("x" * 9000 + "\n")
+            fh.write("b\n")
+        r = await server.rip_file_lines(f, 1, 3, None)
+        check("Huge-line rip stays within the 4000 cap",
+              len(r) <= 4000, f"len={len(r)}")
+        check("Truncated view keeps the marker", "truncated" in r, r[:300])
+
+
+async def test_ranked_max_files_passthrough():
+    print("\n[Test MAP-09] get_repo_skeleton — max_files passthrough (T01 fix)")
+    from harness_core import repomap_adapter
+    with tempfile.TemporaryDirectory() as d:
+        for i in range(6):
+            with open(os.path.join(d, f"mod_{i}.py"), "w") as fh:
+                fh.write(f"def symbol_{i}():\n    return {i}\n")
+
+        text_full, raw_full = repomap_adapter.build_ranked_map_with_stats(d)
+        check("Adapter default walks every file",
+              "6 files" in text_full, text_full[:200])
+        text_limited, raw_limited = repomap_adapter.build_ranked_map_with_stats(
+            d, max_files=2)
+        check("Adapter honours max_files",
+              "2 files" in text_limited, text_limited[:200])
+        check("Limited walk reads fewer bytes",
+              raw_limited < raw_full, f"{raw_limited} vs {raw_full}")
+
+        out = await server.get_repo_skeleton(repo_path=d, mode="ranked",
+                                             max_files=3)
+        check("Server passes max_files to the adapter",
+              "3 files" in out, out[:300])
+        out_full = await server.get_repo_skeleton(repo_path=d, mode="ranked")
+        check("Server default still walks all files",
+              "6 files" in out_full, out_full[:300])
+
+
+async def test_ranked_cache_content_hash():
+    print("\n[Test MAP-10] repomap adapter — content-hash cache signature (T01 fix)")
+    from harness_core import repomap_adapter
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "same_size.py")
+        content1 = "def alpha(x):\n    return x\n"
+        with open(path, "w") as fh:
+            fh.write(content1)
+        st_before = os.stat(path)
+
+        repomap_adapter._CACHE_STATS["hits"] = 0
+        repomap_adapter._CACHE_STATS["misses"] = 0
+
+        t1, _ = repomap_adapter.build_ranked_map_with_stats(d)
+        misses_after_first = repomap_adapter._CACHE_STATS["misses"]
+        t2, _ = repomap_adapter.build_ranked_map_with_stats(d)
+        hits_after_second = repomap_adapter._CACHE_STATS["hits"]
+        check("MAP-10: first call misses", misses_after_first >= 1,
+              f"misses={misses_after_first}")
+        check("MAP-10: unchanged call hits", hits_after_second >= 1,
+              f"hits={hits_after_second}")
+
+        # Same size, restored timestamp, different bytes.
+        content2 = content1.replace("alpha", "betaX")
+        with open(path, "w") as fh:
+            fh.write(content2)
+        os.utime(path, ns=(st_before.st_atime_ns, st_before.st_mtime_ns))
+        st_after = os.stat(path)
+        check("MAP-10: size really is unchanged",
+              st_after.st_size == st_before.st_size,
+              f"{st_before.st_size} -> {st_after.st_size}")
+        check("MAP-10: mtime really is restored",
+              st_after.st_mtime_ns == st_before.st_mtime_ns,
+              f"{st_before.st_mtime_ns} -> {st_after.st_mtime_ns}")
+
+        misses_before = repomap_adapter._CACHE_STATS["misses"]
+        t3, _ = repomap_adapter.build_ranked_map_with_stats(d)
+        misses_after = repomap_adapter._CACHE_STATS["misses"]
+        check("MAP-10: same-size, same-mtime edit is a cache miss",
+              misses_after > misses_before,
+              f"{misses_before} -> {misses_after}")
+        check("MAP-10: recomputed map carries the new symbol",
+              "betaX" in t3, t3[:300])
+        check("MAP-10: stale cached text was not served",
+              t3 != t1 and "alpha" not in t3, t3[:300])
+
+
+async def test_lint_post_execution_freshness():
+    print("\n[Test LINT-15] lint_file — post-execution freshness (T05 fix)")
+    from unittest.mock import patch
+    from subprocess import CompletedProcess
+
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "racy.py")
+        with open(f, "w") as fh:
+            fh.write("def a():\n    return 1\n")
+
+        def race(*args, **kwargs):
+            # The file changes while py_compile "runs".
+            with open(f, "w") as fh:
+                fh.write("def a():\n    return 2\n")
+            return CompletedProcess(args=args, returncode=0,
+                                    stdout="", stderr="")
+
+        with patch("server.subprocess.run", side_effect=race):
+            r = await server.lint_file(f)
+        check("OK prefix preserved", r.startswith("OK:"), r[:300])
+        check("Freshness note present",
+              "source changed during compilation" in r, r[:300])
+        check("Rerun advice present", "rerun to confirm" in r, r[:300])
+        check("Basename still reported", "racy.py" in r, r[:300])
+
+        # A stable source keeps the plain OK response — no false note.
+        r2 = await server.lint_file(f)
+        check("Unchanged source gets no note",
+              r2.startswith("OK:") and "note:" not in r2, r2[:300])
+
+
+async def test_db_missing_file_not_created():
+    print("\n[Test DB-01] inspect_database_schema — missing file, no side effect (T09)")
+    with tempfile.TemporaryDirectory() as d:
+        db_path = os.path.join(d, "missing.sqlite")
+        r = await server.inspect_database_schema(db_path)
+        check("Returns ERROR", "ERROR" in r, r[:200])
+        check("Says 'not found'", "not found" in r, r[:200])
+        check("Reports absolute path", os.path.abspath(db_path) in r, r[:200])
+        check("File NOT created by the call", os.path.exists(db_path) is False)
+
+
+async def test_db_readonly_connection_enforced():
+    print("\n[Test DB-02] inspect_database_schema — read-only connection (T09)")
+    with tempfile.TemporaryDirectory() as d:
+        db_path = os.path.join(d, "readonly.sqlite")
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT NOT NULL)"
+        )
+        conn.commit()
+        conn.close()
+
+        before = os.stat(db_path)
+        r = await server.inspect_database_schema(db_path)
+        after = os.stat(db_path)
+
+        check("Table name present", "users" in r, r[:300])
+        check("Column name present", "email" in r, r[:300])
+        check("PK rendered", "PK" in r, r[:300])
+        check("File size unchanged", before.st_size == after.st_size,
+              f"{before.st_size} -> {after.st_size}")
+        check("File mtime unchanged",
+              before.st_mtime_ns == after.st_mtime_ns,
+              f"{before.st_mtime_ns} -> {after.st_mtime_ns}")
+
+        conn = sqlite3.connect(db_path)
+        names = [row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+        conn.close()
+        check("No new tables appeared", names == ["users"], str(names))
+
+
+async def test_db_selected_schema_and_identifiers():
+    print("\n[Test DB-03] inspect_database_schema — tables= filter + identifiers (T09)")
+    with tempfile.TemporaryDirectory() as d:
+        db_path = os.path.join(d, "identifiers.sqlite")
+        conn = sqlite3.connect(db_path)
+        conn.execute('CREATE TABLE "spaces here" '
+                     '(id INTEGER PRIMARY KEY, label TEXT NOT NULL)')
+        conn.execute('CREATE TABLE "quotes""inside" '
+                     '(id INTEGER PRIMARY KEY, val TEXT)')
+        conn.execute('CREATE TABLE "normal" (id INTEGER PRIMARY KEY)')
+        conn.commit()
+        conn.close()
+
+        r = await server.inspect_database_schema(
+            db_path, tables='spaces here,quotes"inside')
+        check("Requested table shown", "spaces here" in r, r[:400])
+        check("Table with quotes shown", 'quotes"inside' in r, r[:400])
+        check("Unrequested table omitted", "normal" not in r, r[:400])
+        check("Header reports true counts",
+              "# schema — 2 of 3 tables" in r, r[:400])
+        check("At least one column rendered for 'spaces here'",
+              re.search(
+                  r"## spaces here\n(?:.*\n)*?  - \w+ \w+", r) is not None,
+              r[:400])
+
+        r2 = await server.inspect_database_schema(
+            db_path, tables="spaces here,bogus_table")
+        check("Bogus requested table reported",
+              "# requested table not found: bogus_table" in r2, r2[:400])
+
+
+async def test_db_no_application_data_and_bounds():
+    print("\n[Test DB-04] inspect_database_schema — no data leak, bounded (T09)")
+    with tempfile.TemporaryDirectory() as d:
+        db_path = os.path.join(d, "secrets.sqlite")
+        conn = sqlite3.connect(db_path)
+        for i in range(3):
+            conn.execute(f"CREATE TABLE t{i} "
+                         "(id INTEGER PRIMARY KEY, note TEXT)")
+            conn.execute(f"INSERT INTO t{i} (note) VALUES "
+                         "('SECRET_SENTINEL_DO_NOT_SHOW')")
+        conn.commit()
+        conn.close()
+
+        r = await server.inspect_database_schema(db_path)
+        check("No sentinel value in response",
+              "SECRET_SENTINEL_DO_NOT_SHOW" not in r, r[:400])
+        check("Response ≤ 4000 chars", len(r) <= 4000, f"len={len(r)}")
+        check("All three tables listed",
+              "## t0" in r and "## t1" in r and "## t2" in r, r[:400])
+        check("Column type still shown", "TEXT" in r, r[:400])
+
+
+async def test_db_many_tables_truncated():
+    print("\n[Test DB-05] inspect_database_schema — 50-table cap (T09)")
+    with tempfile.TemporaryDirectory() as d:
+        db_path = os.path.join(d, "many.sqlite")
+        conn = sqlite3.connect(db_path)
+        conn.executescript(
+            "".join(f"CREATE TABLE t{i:02d} "
+                    "(id INTEGER PRIMARY KEY, v TEXT);\n"
+                    for i in range(60))
+        )
+        conn.commit()
+        conn.close()
+
+        r = await server.inspect_database_schema(db_path)
+        check("Response ≤ 4000 chars", len(r) <= 4000, f"len={len(r)}")
+        check("Truncation marker present",
+              "[truncated" in r or "tables omitted" in r, r[-400:])
+        check("Count reflects the cap",
+              "# schema — 50 of 60 tables" in r, r[:200])
+        check("Capped note mentions tables=",
+              "use tables= to select" in r, r[-400:])
+
+
+async def test_db_wal_and_sidecar():
+    print("\n[Test DB-06] inspect_database_schema — WAL sidecar files (T09)")
+    with tempfile.TemporaryDirectory() as d:
+        db_path = os.path.join(d, "wal.sqlite")
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE wal_table "
+                     "(id INTEGER PRIMARY KEY, v TEXT)")
+        conn.execute("INSERT INTO wal_table (v) VALUES ('row')")
+        conn.commit()
+
+        r = await server.inspect_database_schema(db_path)
+        check("No error on WAL database", "ERROR" not in r, r[:300])
+        check("WAL table listed", "wal_table" in r, r[:300])
+        check("Column listed", "v " in r, r[:300])
+
+        conn.close()
+
+
+async def test_db_error_closes_and_preserves():
+    print("\n[Test DB-07] inspect_database_schema — non-SQLite file (T09)")
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "plain.txt")
+        original = "plain text, definitely not a sqlite database\n"
+        with open(path, "w") as fh:
+            fh.write(original)
+        before = os.stat(path)
+
+        r = await server.inspect_database_schema(path)
+        after = os.stat(path)
+
+        check("Returns ERROR", "ERROR" in r, r[:300])
+        check("File content unchanged", open(path).read() == original)
+        check("File size unchanged", before.st_size == after.st_size)
+        check("File mtime unchanged",
+              before.st_mtime_ns == after.st_mtime_ns)
+
+
 async def main():
     print("=" * 60)
     print("Harness-Optimizer Fix Verification")
@@ -2040,6 +2476,21 @@ async def main():
     await test_rollback_bounded()
     await test_rollback_manual_command_present()
     await test_rollback_no_hooks_or_external_diff()
+    await test_git_partial_stage_refused()
+    await test_edit_preserves_mixed_newlines()
+    await test_edit_rejects_overlapping_match()
+    await test_rollback_truncation_keeps_lines()
+    await test_read_fitting_never_overflows()
+    await test_ranked_max_files_passthrough()
+    await test_ranked_cache_content_hash()
+    await test_lint_post_execution_freshness()
+    await test_db_missing_file_not_created()
+    await test_db_readonly_connection_enforced()
+    await test_db_selected_schema_and_identifiers()
+    await test_db_no_application_data_and_bounds()
+    await test_db_many_tables_truncated()
+    await test_db_wal_and_sidecar()
+    await test_db_error_closes_and_preserves()
 
 
     print("\n" + "=" * 60)

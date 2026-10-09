@@ -74,6 +74,42 @@ async def get_repo_skeleton(repo_path: str = ".", max_files: int = 500,
     if not os.path.isdir(root):
         return f"ERROR: Not a directory: {root}"
 
+    # ── T01: mode-first branching ──
+    # Ranked mode asks the adapter BEFORE any outline work is done, so a
+    # successful ranked call never pays for a discarded outline. The
+    # outline is only walked as the fallback path (adapter failure) or
+    # when mode == "outline".
+    ranked_reason = None
+    if mode == "ranked":
+        try:
+            from harness_core import repomap_adapter
+            ranked, raw_bytes = repomap_adapter.build_ranked_map_with_stats(
+                root, max_tokens=max_tokens, max_files=max_files)
+        except Exception as exc:
+            ranked = f"ERROR: ranked map unavailable — {exc}"
+            raw_bytes = 0
+
+        if not (isinstance(ranked, str) and ranked.startswith("ERROR")):
+            # Honest metric: the ranked text is a truncation of the raw
+            # sources, so the baseline is the token count of the bytes
+            # actually read (``raw_bytes``), and the actual is the token
+            # count of the returned ranked text.
+            ranked_actual = estimate_tokens(ranked)
+            ranked_baseline = estimate_tokens(" " * raw_bytes)
+            ranked_saved = max(0, ranked_baseline - ranked_actual)
+            ranked_metric = (
+                f"[TOKEN METRIC] tool=get_repo_skeleton "
+                f"saved={ranked_saved} baseline={ranked_baseline} "
+                f"actual={ranked_actual} type=payload_reduction"
+            )
+            return ranked + "\n\n" + ranked_metric
+
+        reason = ranked.split("ERROR:", 1)[-1].strip()
+        redundant = "ranked map unavailable — "
+        if reason.startswith(redundant):
+            reason = reason[len(redundant):]
+        ranked_reason = reason
+
     SKIP_DIRS = {".git", "venv", ".venv", "env", "__pycache__",
                  "node_modules", "dist", "build", ".tox", ".mypy_cache",
                  ".pytest_cache", "site-packages"}
@@ -159,37 +195,13 @@ async def get_repo_skeleton(repo_path: str = ".", max_files: int = 500,
     if mode == "outline":
         return outline
 
-    # mode == "ranked": return ONLY the ranked map + metric (no outline).
-    try:
-        from harness_core import repomap_adapter
-        ranked, raw_bytes = repomap_adapter.build_ranked_map_with_stats(
-            root, max_tokens=max_tokens)
-    except Exception as exc:
-        ranked = f"ERROR: ranked map unavailable — {exc}"
-        raw_bytes = 0
-
-    if isinstance(ranked, str) and ranked.startswith("ERROR"):
-        reason = ranked.split("ERROR:", 1)[-1].strip()
-        redundant = "ranked map unavailable — "
-        if reason.startswith(redundant):
-            reason = reason[len(redundant):]
-        note = f"# ranked mode unavailable — {reason}; falling back to outline"
-        return note + "\n" + outline
-
-    # Honest metric: the ranked text is a truncation of the raw sources,
-    # so the baseline is the token count of the bytes actually read
-    # (``raw_bytes``, summed from os.path.getsize over the walked files),
-    # and the actual is the token count of the returned ranked text.
-    # No estimate is derived from the output length itself.
-    ranked_actual = estimate_tokens(ranked)
-    ranked_baseline = estimate_tokens(" " * raw_bytes)
-    ranked_saved = max(0, ranked_baseline - ranked_actual)
-    ranked_metric = (
-        f"[TOKEN METRIC] tool=get_repo_skeleton "
-        f"saved={ranked_saved} baseline={ranked_baseline} actual={ranked_actual} "
-        f"type=payload_reduction"
+    # mode == "ranked" but the adapter failed above: fall back to the
+    # outline (the ranked block never ran, so this is the only walk).
+    note = (
+        f"# ranked mode unavailable — {ranked_reason or 'unknown error'}; "
+        f"falling back to outline"
     )
-    return ranked + "\n\n" + ranked_metric
+    return note + "\n" + outline
 
 # T02 tuning constants for rip_file_lines
 _RIP_MAX_CHARS = 4000          # hard response cap
@@ -215,16 +227,23 @@ def _fit_lines(lines, budget):
 
 def _fit_or_mark(lines, budget, inline=" ... [truncated] ..."):
     """_fit_lines, with one documented exception: when the next line
-    alone exceeds `budget`, keep that line's leading slice with an
-    explicit in-line marker instead of silently dropping it. The numeric
-    prefix sits at the start of every line, so it survives the slice."""
+    cannot fit in the REMAINING budget, keep that line's leading slice
+    with an explicit in-line marker instead of silently dropping it.
+    The numeric prefix sits at the start of every line, so it survives
+    the slice. The returned lines never join to more than `budget`
+    characters — the `out` already consumed is subtracted first."""
     out = _fit_lines(lines, budget)
-    if len(out) < len(lines):
-        nxt = lines[len(out)]
-        if len(nxt) > budget:
-            room = budget - len(inline) - (1 if out else 0)
-            if room > 0:
-                out = out + [nxt[:room] + inline]
+    if len(out) >= len(lines):
+        return out
+    used = sum(len(l) for l in out) + max(0, len(out) - 1)
+    sep = 1 if out else 0
+    avail = budget - used - sep - len(inline)
+    if avail <= 0:
+        return out
+    nxt = lines[len(out)]
+    # Only mark when the whole line cannot fit in the remaining budget
+    if len(nxt) + sep > (budget - used):
+        out = out + [nxt[:avail] + inline]
     return out
 
 
@@ -658,8 +677,12 @@ async def apply_search_replace(file_path: str, search_block: str, replace_block:
     """Replace the exact `search_block` with `replace_block` once.
 
     Matching is a strict, case-sensitive substring match against the
-    file text (newline-normalized). Zero matches or more than one
-    match are errors - callers must add context to disambiguate.
+    file's decoded text; `search_block` and `replace_block` are
+    converted to the file's dominant newline before matching. Bytes
+    outside the replaced range are never rewritten, so a file with
+    mixed line endings keeps its minority convention intact.
+    Zero matches, overlapping matches and more than one match are
+    errors - callers must add context to disambiguate.
 
     expected_sha256 (optional) is a stale-content guard: when given,
     the file's current sha256 must match or the edit is refused and
@@ -693,28 +716,41 @@ async def apply_search_replace(file_path: str, search_block: str, replace_block:
             f"current_sha256: {before_sha}"
         )
 
+    # Decode with surrogateescape so arbitrary bytes round-trip exactly.
     text = raw_before.decode("utf-8", errors="surrogateescape")
     newline = _detect_newline(text)
 
-    # Match on LF-normalized text so callers pass conventional \n
-    # blocks regardless of the file's own convention.
-    norm_text = text.replace("\r\n", "\n")
-    norm_search = search_block.replace("\r\n", "\n")
-    norm_replace = replace_block.replace("\r\n", "\n")
+    # Convert ONLY the search/replace blocks to the file's dominant
+    # newline. The raw text itself is never re-normalized, so every
+    # byte outside the matched range survives untouched — mixed-newline
+    # files keep their minority convention.
+    norm_search = _normalize_newlines(search_block, newline)
+    norm_replace = _normalize_newlines(replace_block, newline)
 
-    count = norm_text.count(norm_search)
+    # Manual scan (not str.count) so overlapping occurrences are found
+    # too: "aa" in "aaa" must report 2 matches, not 1.
+    positions = []
+    start = 0
+    while True:
+        i = text.find(norm_search, start)
+        if i == -1:
+            break
+        positions.append(i)
+        start = i + 1
+    count = len(positions)
     if count == 0:
         return f"ERROR: TARGET SEARCH BLOCK NOT FOUND EXACTLY in {path}"
     if count > 1:
         return (f"ERROR: Search block matches {count} locations. "
                 f"Please provide more context to make it unique.")
 
-    pos = norm_text.find(norm_search)
-    start_line = norm_text[:pos].count("\n") + 1
+    pos = positions[0]
+    start_line = text[:pos].count("\n") + 1
     end_line = start_line + norm_search.count("\n")
 
-    new_norm = norm_text.replace(norm_search, norm_replace, 1)
-    new_text = _normalize_newlines(new_norm, newline)
+    # Replace only the matched byte range; everything else is copied
+    # through verbatim.
+    new_text = text[:pos] + norm_replace + text[pos + len(norm_search):]
     raw_after = new_text.encode("utf-8", errors="surrogateescape")
     after_sha = hashlib.sha256(raw_after).hexdigest()
 
@@ -727,8 +763,11 @@ async def apply_search_replace(file_path: str, search_block: str, replace_block:
         )
 
     # Compact unified-ish diff: the replaced lines vs the new lines.
-    removed = [f"    - {ln}" for ln in norm_search.split("\n")]
-    added = [f"    + {ln}" for ln in norm_replace.split("\n")]
+    # Shown LF-normalized so the response never carries stray \r bytes.
+    display_search = norm_search.replace("\r\n", "\n")
+    display_replace = norm_replace.replace("\r\n", "\n")
+    removed = [f"    - {ln}" for ln in display_search.split("\n")]
+    added = [f"    + {ln}" for ln in display_replace.split("\n")]
     diff_lines = removed + added
     if len(diff_lines) > _EDIT_MAX_DIFF_LINES:
         # Keep at most _EDIT_MAX_DIFF_LINES combined -/+ lines.
@@ -871,6 +910,19 @@ async def lint_file(file_path: str) -> str:
 
     # Build execution header only for non-OK results
     if res.returncode == 0:
+        # Post-execution freshness: an edit racing py_compile means this
+        # verdict describes bytes that may no longer be on disk.
+        if sha_before is not None:
+            try:
+                with open(path, "rb") as _sf:
+                    sha_after_ok = hashlib.sha256(_sf.read()).hexdigest()
+            except OSError:
+                sha_after_ok = None
+            if sha_after_ok != sha_before:
+                return (
+                    f"OK: Python syntax check passed — {basename} "
+                    "(note: source changed during compilation; rerun to confirm)"
+                )
         return f"OK: Python syntax check passed — {os.path.basename(path)}"
 
     # Build execution header for FAIL responses
@@ -1031,15 +1083,37 @@ def _git_detail(err: str) -> str:
 
 def _truncate_middle(text: str, limit: int) -> str:
     """Elide the middle of *text* so the result fits in *limit* chars.
-    The head and the tail of the text both survive."""
+
+    Truncation is entry-based: whole lines are kept or dropped, so a
+    path (or any other entry) is never sliced in half — an omitted
+    entry is dropped outright instead of being rendered as a partial
+    one. The head and the tail of the text both survive, and the
+    marker always lands on its own line."""
     if len(text) <= limit:
         return text
-    suffix = "\n... [truncated] ...\n"
-    if limit <= len(suffix):
+    marker = "\n... [truncated] ...\n"
+    if limit <= len(marker):
         return text[:limit]
-    budget = limit - len(suffix)
-    half = budget // 2
-    return text[:half] + suffix + text[-half:]
+    budget = limit - len(marker)
+    lines = text.splitlines(keepends=True)
+    head_lines = []
+    head_used = 0
+    for ln in lines:
+        if head_used + len(ln) > budget // 2:
+            break
+        head_lines.append(ln)
+        head_used += len(ln)
+    tail_lines = []
+    tail_used = 0
+    for ln in reversed(lines):
+        if tail_used + len(ln) > budget - head_used:
+            break
+        tail_lines.insert(0, ln)
+        tail_used += len(ln)
+    result = "".join(head_lines) + marker + "".join(tail_lines)
+    if len(result) > limit:
+        result = result[:limit]
+    return result
 
 
 def _bound_4000(text: str) -> str:
@@ -1088,6 +1162,23 @@ async def git_checkpoint(file_path: str, change_summary: str) -> str:
             "Please commit or unstage them before using git_checkpoint.\n"
             f"Staged files: {', '.join(sorted(staged))}"
         )
+
+    # ── T06-7: refuse a target that is BOTH staged and unstaged ──
+    # `git add` would sweep the user's unstaged edits into our commit,
+    # so a partially-staged target is refused before any staging happens.
+    rc, out, err = _run_git(["status", "--porcelain", "--", rel_target], repo_dir)
+    if rc != 0:
+        return _bound_4000(f"ERROR: git status failed — {_git_detail(err)}")
+    for line in out.splitlines():
+        if len(line) < 2:
+            continue
+        index_status = line[0]
+        worktree_status = line[1]
+        if index_status in ("M", "A", "R", "C") and worktree_status in ("M", "A", "R", "C", "D"):
+            return _bound_4000(
+                "ERROR: target file has both staged and unstaged changes — "
+                "commit or stash them before using git_checkpoint"
+            )
 
     # ── T06-4: every git invocation is return-code checked ──
     rc, out, err = _run_git(["add", rel_target], repo_dir)
@@ -1331,31 +1422,116 @@ async def execute_and_capture(command: str, timeout_seconds: int = 15):
             f"Command timed out after {timeout_seconds} seconds."
         )
 
+_DB_MAX_TABLES = 50
+_DB_MAX_CHARS = 4000
+
+
+def _quote_ident(name: str) -> str:
+    """Double-quote an SQLite identifier so it can be embedded in a PRAGMA.
+
+    sqlite3 exposes no bind parameter for PRAGMA arguments, so quoting the
+    identifier is the only safe interpolation; embedded double-quotes are
+    doubled per the SQL standard."""
+    return '"' + name.replace('"', '""') + '"'
+
+
 @register("inspect_database_schema")
-async def inspect_database_schema(db_path: str) -> str:
-    """Read-only. Lists every SQLite table with columns, types, and PKs."""
+async def inspect_database_schema(db_path: str, tables: str = "") -> str:
+    """Read-only. Lists SQLite tables with columns, PKs, FKs, and indexes.
+
+    Never reads application data: only sqlite_master and PRAGMA queries
+    run, over a `mode=ro` URI connection that cannot write. Optional
+    `tables` is a comma-separated list of exact table names ("" = all)."""
+    import urllib.parse
+
     db_path = os.path.expanduser(db_path)
-    if not os.path.exists(db_path):
-        return f"Error: Database not found at {db_path}"
+    abs_path = os.path.abspath(db_path)
+    uri_path = urllib.parse.quote(abs_path, safe="/")
+    uri = f"file:{uri_path}?mode=ro"
     try:
-        conn = sqlite3.connect(db_path)
-        cur = conn.cursor()
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table';")
-        tables = cur.fetchall()
-        if not tables:
-            conn.close()
-            return "SQLite DB exists but contains no tables."
-        out = []
-        for (t_name,) in tables:
-            out.append(f"\n📊 TABLE: {t_name}")
-            cur.execute(f"PRAGMA table_info({t_name});")
-            for col in cur.fetchall():
-                pk = " [PRIMARY KEY]" if col[5] else ""
-                out.append(f"  - {col[1]} ({col[2]}){pk}")
+        conn = sqlite3.connect(uri, uri=True, timeout=5)
+    except sqlite3.Error as exc:
+        if not os.path.exists(abs_path):
+            return f"ERROR: database not found — {abs_path}"
+        return f"ERROR: cannot open database — {exc}"
+    except Exception as exc:  # pragma: no cover — defensive
+        return f"ERROR: cannot open database — {exc}"
+
+    try:
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name NOT LIKE 'sqlite_%' "
+                "ORDER BY name"
+            )
+            all_tables = [r[0] for r in cur.fetchall()]
+        except sqlite3.Error as exc:
+            return f"ERROR: cannot open database — {exc}"
+
+        notes: list[str] = []
+        pool = all_tables
+        wanted = [t.strip() for t in tables.split(",") if t.strip()]
+        if wanted:
+            wanted_set = set(wanted)
+            pool = [t for t in all_tables if t in wanted_set]
+            for name in wanted:
+                if name not in all_tables:
+                    notes.append(f"# requested table not found: {name}")
+
+        selected = pool[:_DB_MAX_TABLES]
+        omitted = len(pool) - len(selected)
+
+        blocks = []
+        for table in selected:
+            try:
+                cur.execute(f"PRAGMA table_info({_quote_ident(table)})")
+                columns = cur.fetchall()
+                cur.execute(f"PRAGMA foreign_key_list({_quote_ident(table)})")
+                fks = cur.fetchall()
+                cur.execute(f"PRAGMA index_list({_quote_ident(table)})")
+                indexes = cur.fetchall()
+            except sqlite3.Error as exc:
+                return f"ERROR: cannot open database — {exc}"
+
+            lines = [f"## {table}"]
+            for _cid, cname, ctype, notnull, _dflt, pk in columns:
+                line = f"  - {cname} {ctype}"
+                if pk:
+                    line += " PK"
+                if notnull:
+                    line += " NOT NULL"
+                lines.append(line)
+            for _id, _seq, fk_table, fk_from, fk_to, *_rest in fks:
+                lines.append(f"  FK {fk_from} -> {fk_table}.{fk_to}")
+            for _seq, idx_name, idx_unique, *_rest in indexes:
+                try:
+                    cur.execute(f"PRAGMA index_info({_quote_ident(idx_name)})")
+                    idx_cols = [
+                        r[2] if r[2] is not None else "?"
+                        for r in cur.fetchall()
+                    ]
+                except sqlite3.Error as exc:
+                    return f"ERROR: cannot open database — {exc}"
+                suffix = " UNIQUE" if idx_unique else ""
+                lines.append(
+                    f"  IDX {idx_name} (" + ", ".join(idx_cols) + ")" + suffix
+                )
+            blocks.append("\n".join(lines))
+
+        head = [f"# schema — {len(selected)} of {len(all_tables)} tables"]
+        head.extend(notes)
+        text = "\n".join(head)
+        if blocks:
+            text += "\n\n" + "\n\n".join(blocks)
+        if omitted:
+            text += (
+                f"\n# ... [truncated: {omitted} tables omitted; "
+                "use tables= to select]"
+            )
+        return _truncate_middle(text, _DB_MAX_CHARS)
+    finally:
         conn.close()
-        return "\n".join(out)
-    except Exception as exc:
-        return f"Schema extraction failed: {exc}"
 
 
 if __name__ == "__main__":
