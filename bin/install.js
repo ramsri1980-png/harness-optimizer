@@ -431,19 +431,42 @@ for (const key of Object.keys(cfg.mcp)) {
 }
 
 // Merge into any existing harness-tools entry — do not blow away user
-// choices (environment.HARNESS_TOOLS, disabled state, custom fields).
+// choices (environment.HARNESS_TOOLS, custom fields).
+//
+// OpenCode's McpLocalConfig schema accepts only: type, command, cwd,
+// environment, enabled, timeout. The legacy `disabled` key was never
+// valid; because the schema uses additionalProperties: false, writing
+// it caused OpenCode to reject the entry in a way that left the
+// server connected but its tools unreachable by the model. We now
+// write the correct `enabled` key and strip legacy/invalid keys.
 const existingHarnessTools = cfg.mcp.servers["harness-tools"] || {};
+
+// Translate any legacy `disabled` flag into the schema-valid `enabled`
+// flag. Prefer an explicit `enabled` when both are present. Default to
+// enabled on first install.
+const userEnabled =
+  existingHarnessTools.enabled !== undefined
+    ? existingHarnessTools.enabled
+    : existingHarnessTools.disabled !== undefined
+      ? !existingHarnessTools.disabled
+      : true;
+
+// Drop keys that are not in the schema so they don't linger in a user's
+// config across reinstalls.
+const cleanExisting = { ...existingHarnessTools };
+delete cleanExisting.disabled;
+delete cleanExisting.codemode;
+delete cleanExisting.codeMode;
+delete cleanExisting.code_mode;
+
 cfg.mcp.servers["harness-tools"] = {
-  ...existingHarnessTools,
+  ...cleanExisting,
   type: "local",
   command: [
     path.join(TOOLS_DIR, "venv", "bin", "python"),
     path.join(TOOLS_DIR, "server.py"),
   ],
-  // Preserve the user's disabled flag if set; default to false only on first install
-  disabled: existingHarnessTools.disabled !== undefined
-    ? existingHarnessTools.disabled
-    : false,
+  enabled: userEnabled,
 };
 
 // ── Providers: V2 shape ──
