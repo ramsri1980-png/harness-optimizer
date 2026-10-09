@@ -961,90 +961,206 @@ async def lint_file(file_path: str) -> str:
 
     return result
 
+def _run_git(args, cwd, timeout=10):
+    """Run a git subcommand safely.
+
+    Returns (returncode, stdout, stderr). On missing git binary or
+    timeout, returncode is -1 and stderr carries a short reason.
+    Never uses shell=True. Never modifies git config.
+    """
+    try:
+        res = subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            shell=False,
+            timeout=timeout,
+        )
+        return res.returncode, res.stdout, res.stderr
+    except FileNotFoundError:
+        if not os.path.isdir(cwd):
+            return -1, "", f"working directory does not exist: {cwd}"
+        return -1, "", "git not available on PATH"
+    except subprocess.TimeoutExpired:
+        return -1, "", f"git {' '.join(args[:2])} timed out after {timeout}s"
+
+
+def _git_detail(err: str) -> str:
+    """First line of git stderr, or 'unknown' when stderr is empty."""
+    err = (err or "").strip()
+    return err.splitlines()[0] if err else "unknown"
+
+
+def _truncate_middle(text: str, limit: int) -> str:
+    """Elide the middle of *text* so the result fits in *limit* chars.
+    The head and the tail of the text both survive."""
+    if len(text) <= limit:
+        return text
+    suffix = "\n... [truncated] ...\n"
+    if limit <= len(suffix):
+        return text[:limit]
+    budget = limit - len(suffix)
+    half = budget // 2
+    return text[:half] + suffix + text[-half:]
+
+
+def _bound_4000(text: str) -> str:
+    """Hard cap for git tool responses (T06-6 / T07-6)."""
+    return _truncate_middle(text, 4000)
+
+
 @register("git_checkpoint")
-async def git_checkpoint(file_path: str, change_summary: str):
-    import subprocess
-    path = os.path.abspath(os.path.expanduser(file_path))
-    repo_dir = os.path.dirname(path)
-    
-    # Check if there are other staged files before we commit
-    status = subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=repo_dir,
-        capture_output=True,
-        text=True
-    )
-    # Porcelain output for staged files begins with characters like 'M ', 'A ', 'D ', 'R '
-    staged_files = [
-        line[3:].strip() for line in status.stdout.splitlines()
-        if len(line) > 3 and line[0] not in (' ', '?')
-    ]
-    
-    rel_path = os.path.relpath(path, repo_dir)
-    
-    if staged_files and staged_files != [rel_path]:
-        return (
+async def git_checkpoint(file_path: str, change_summary: str) -> str:
+    """Commit ONLY file_path under a [harness]-prefixed message.
+
+    Refuses when unrelated files are staged, so the user's own work is
+    never swept into our commit. Never modifies git config.
+    """
+    if len(change_summary) > 200:
+        change_summary = change_summary[:197] + "..."
+
+    # ── T06-2: canonical repository root discovery ──
+    start_dir = os.path.dirname(os.path.realpath(file_path))
+    rc, out, err = _run_git(["rev-parse", "--show-toplevel"], cwd=start_dir)
+    if rc != 0:
+        return _bound_4000(
+            "ERROR: not a git repository — "
+            f"{os.path.dirname(os.path.abspath(file_path))}"
+        )
+    repo_dir = out.strip()
+
+    # The target has to live inside that repository.
+    real_target = os.path.realpath(file_path)
+    real_root = os.path.realpath(repo_dir)
+    if not real_target.startswith(real_root + os.sep):
+        return _bound_4000(
+            "ERROR: target file is outside the repository root — "
+            f"{os.path.basename(file_path)}"
+        )
+
+    # ── T06-3: robust staged-work detection (NUL-delimited) ──
+    rc, out, err = _run_git(["diff", "--cached", "--name-only", "-z"], repo_dir)
+    if rc != 0:
+        return _bound_4000(f"ERROR: git diff failed — {_git_detail(err)}")
+    staged = [p for p in out.split("\0") if p]
+    rel_target = os.path.relpath(real_target, real_root)
+    if staged and staged != [rel_target]:
+        return _bound_4000(
             "ERROR: Unrelated staged files detected. "
             "Please commit or unstage them before using git_checkpoint.\n"
-            f"Staged files: {', '.join(staged_files)}"
+            f"Staged files: {', '.join(sorted(staged))}"
         )
-        
-    subprocess.run(["git", "add", rel_path], cwd=repo_dir)
-    
-    # Use '-- <path>' to commit ONLY this file, ignoring any other staged changes
-    result = subprocess.run(
-        ["git", "commit", "-m", f"[harness] {change_summary}", "--", rel_path],
-        cwd=repo_dir,
-        capture_output=True,
-        text=True
+
+    # ── T06-4: every git invocation is return-code checked ──
+    rc, out, err = _run_git(["add", rel_target], repo_dir)
+    if rc != 0:
+        return _bound_4000(f"ERROR: git add failed — {_git_detail(err)}")
+
+    # '-- <path>' commits ONLY this file, ignoring any other staged work.
+    rc, out, err = _run_git(
+        ["commit", "-m", f"[harness] {change_summary}", "--", rel_target],
+        repo_dir,
     )
-    
-    if result.returncode != 0:
-        return f"ERROR: Commit failed:\n{result.stderr}\n{result.stdout}"
-        
-    return f"Committed: {change_summary}"
+    if rc != 0:
+        if "Please tell me who you are" in (err + out):
+            return _bound_4000(
+                "ERROR: git user identity is not configured — set "
+                "user.email and user.name before committing"
+            )
+        return _bound_4000(
+            f"ERROR: git commit failed — {err.strip() or 'unknown'}"
+        )
+
+    # ── T06-5: success response ──
+    rc, commit_id, err = _run_git(["rev-parse", "HEAD"], repo_dir)
+    if rc != 0:
+        return _bound_4000(f"ERROR: git rev-parse failed — {_git_detail(err)}")
+    commit_id = commit_id.strip()
+
+    rc, out, err = _run_git(["show", "--name-only", "--format=", "HEAD"], repo_dir)
+    if rc != 0:
+        return _bound_4000(f"ERROR: git show failed — {_git_detail(err)}")
+    changed_paths = sorted(p for p in out.splitlines() if p.strip())
+
+    # ── T06-6: bounded response, header and commit_id always intact ──
+    head = (
+        f"Committed: {change_summary}\n"
+        f"commit_id: {commit_id}\n"
+        "changed_paths:"
+    )
+    body = "\n".join(f"  {p}" for p in changed_paths)
+    resp = f"{head}\n{body}" if body else head
+    if len(resp) > 4000:
+        room = 4000 - len(head) - 1
+        if body and room > len("\n... [truncated] ...\n"):
+            resp = f"{head}\n{_truncate_middle(body, room)}"
+        else:
+            resp = _bound_4000(resp)
+    return resp
 
 @register("rollback_show")
 async def rollback_show(repo_path: str) -> str:
     """READ-ONLY. Shows what would be lost if the user resets the repo.
     Does NOT execute any rollback. Presents copyable commands."""
     try:
-        diff_staged = subprocess.run(
-            ["git", "diff", "--cached", "--stat"], cwd=repo_path,
-            capture_output=True, text=True, shell=False,
-        )
-        diff_unstaged = subprocess.run(
-            ["git", "diff", "--stat"], cwd=repo_path,
-            capture_output=True, text=True, shell=False,
-        )
-        status = subprocess.run(
-            ["git", "status", "--porcelain"], cwd=repo_path,
-            capture_output=True, text=True, shell=False,
-        )
-        stash = subprocess.run(
-            ["git", "stash", "list"], cwd=repo_path,
-            capture_output=True, text=True, shell=False,
-        )
+        # ── T07-2: canonical repository root discovery ──
+        real_root = os.path.realpath(os.path.abspath(repo_path))
+        rc, out, err = _run_git(["rev-parse", "--show-toplevel"], cwd=real_root)
+        if rc != 0:
+            return f"ERROR: not a git repository — {real_root}"
+        repo_dir = out.strip()
 
+        # ── T07-3: read-only status gathering ──
+        # These invocations never trigger hooks, external diff drivers
+        # or textconv filters, and never write to the repo.
+        rc_st, out_st, err_st = _run_git(
+            ["diff", "--cached", "--stat", "--no-ext-diff", "--no-textconv"],
+            repo_dir,
+        )
+        rc_un, out_un, err_un = _run_git(
+            ["-c", "diff.external=", "diff", "--no-ext-diff", "--no-textconv",
+             "--stat"],
+            repo_dir,
+        )
+        rc_sts, out_sts, err_sts = _run_git(
+            ["--no-optional-locks", "status", "--porcelain"], repo_dir
+        )
+        rc_sh, out_sh, err_sh = _run_git(["stash", "list"], repo_dir)
+
+        def section(cmd_rc, cmd_out, cmd_err):
+            """Show the git output, or disclose the failure — never a
+            pretend '(none)' when the inspection itself broke."""
+            if cmd_rc != 0:
+                return f"(inspection failed: {_git_detail(cmd_err)})"
+            return cmd_out.strip() or "(none)"
+
+        # ── T07-4: accurate categories and counts ──
         r = ["═══ ROLLBACK IMPACT REPORT ═══", ""]
-        staged_text = diff_staged.stdout.strip()
-        unstaged_text = diff_unstaged.stdout.strip()
         r.append("Staged changes (in index, would be lost by reset):")
-        r.append(staged_text or "  (none)")
+        r.append(section(rc_st, out_st, err_st))
         r.append("")
         r.append("Unstaged changes (working tree, would be lost by checkout/reset):")
-        r.append(unstaged_text or "  (none)")
-        untracked = [l for l in status.stdout.splitlines() if l.startswith("??")]
-        if untracked:
-            r.append("")
-            r.append("Untracked files (would be DELETED by git clean):")
-            r += [f"  {u}" for u in untracked]
+        r.append(section(rc_un, out_un, err_un))
+        r.append("")
+        r.append("Untracked files (would be DELETED by git clean):")
+        if rc_sts != 0:
+            r.append(f"(inspection failed: {_git_detail(err_sts)})")
+        else:
+            untracked = [
+                line[3:] if line.startswith("?? ") else line[2:]
+                for line in out_sts.splitlines()
+                if line.startswith("??")
+            ]
+            if untracked:
+                r.extend(f"  {u}" for u in untracked)
+            else:
+                r.append("(none)")
+        r.append("")
+        r.append("Existing stashes (preserved by reset):")
+        r.append(section(rc_sh, out_sh, err_sh))
 
-        if stash.stdout.strip():
-            r.append("")
-            r.append("Existing stashes (preserved by reset):")
-            r.append(stash.stdout.strip())
-
+        # T07-5 is structural: only the read-only calls above were made.
         r += [
             "",
             "⚠️  Review the above. Rollback is manual — copy a command below and run",
@@ -1059,9 +1175,10 @@ async def rollback_show(repo_path: str) -> str:
             "Reversible stash instead of delete:",
             "    git stash push -u -m 'harness rollback'",
         ]
-        return "\n".join(r)
+        # ── T07-6: bounded response; header and manual commands survive ──
+        return _truncate_middle("\n".join(r), 4000)
     except Exception as exc:
-        return f"Rollback inspection failed: {exc}"
+        return f"ERROR: rollback inspection failed — {exc}"
 
 
 # ═══════════════════════════════════════════════════════════

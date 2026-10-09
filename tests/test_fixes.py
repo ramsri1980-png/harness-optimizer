@@ -1149,6 +1149,300 @@ async def test_lint_source_change_during_compile_noted():
               "source changed" in r.lower(), r[:500])
 
 
+# ═══════════════════════════════════════════════════════════
+# T06 — git_checkpoint
+# ═══════════════════════════════════════════════════════════
+
+async def test_git_subdirectory_path():
+    print("\n[Test GIT-01] git_checkpoint — subdirectory target (T06)")
+    with tempfile.TemporaryDirectory() as d:
+        subprocess.run(["git", "init", "-q"], cwd=d, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=d, check=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=d, check=True)
+        subdir = os.path.join(d, "src", "deep")
+        os.makedirs(subdir)
+        target = os.path.join(subdir, "code.py")
+        with open(target, "w") as fh:
+            fh.write("x = 1\n")
+        subprocess.run(["git", "add", "."], cwd=d, check=True)
+        subprocess.run(["git", "commit", "-qm", "init"], cwd=d, check=True)
+        with open(target, "a") as fh:
+            fh.write("y = 2\n")
+        r = await server.git_checkpoint(target, "t06 subdir")
+        check("Committed from subdir", "Committed:" in r, r[:300])
+        check("commit_id present", "commit_id:" in r, r[:300])
+        check("Repo-relative path in changed_paths",
+              "src/deep/code.py" in r or "src\\deep\\code.py" in r, r[:500])
+
+
+async def test_git_outside_repo():
+    print("\n[Test GIT-02] git_checkpoint — file outside any repo (T06)")
+    with tempfile.TemporaryDirectory() as d:
+        outside = os.path.join(d, "not_a_repo.py")
+        with open(outside, "w") as fh:
+            fh.write("x = 1\n")
+        r = await server.git_checkpoint(outside, "should fail")
+        check("Not-a-repo rejected", "ERROR" in r.upper(), r[:200])
+
+
+async def test_git_missing_identity():
+    print("\n[Test GIT-03] git_checkpoint — missing git identity (T06)")
+    import server as _s
+    with tempfile.TemporaryDirectory() as d:
+        subprocess.run(["git", "init", "-q"], cwd=d, check=True)
+        empty_home = tempfile.mkdtemp()
+        env = dict(os.environ)
+        env["HOME"] = empty_home
+        env["GIT_CONFIG_NOSYSTEM"] = "1"
+        # Clear repo-local identity so commits cannot succeed
+        subprocess.run(["git", "config", "user.email", ""], cwd=d, check=True)
+        subprocess.run(["git", "config", "user.name", ""], cwd=d, check=True)
+        target = os.path.join(d, "a.py")
+        with open(target, "w") as fh:
+            fh.write("x = 1\n")
+        # Patch _run_git to inherit our isolated env
+        original = _s._run_git
+        def patched(args, cwd, timeout=10):
+            try:
+                res = subprocess.run(
+                    ["git", *args], cwd=cwd, capture_output=True,
+                    text=True, shell=False, timeout=timeout, env=env)
+                return res.returncode, res.stdout, res.stderr
+            except FileNotFoundError:
+                if not os.path.isdir(cwd):
+                    return -1, "", f"working directory does not exist: {cwd}"
+                return -1, "", "git not available on PATH"
+            except subprocess.TimeoutExpired:
+                return -1, "", "timeout"
+        _s._run_git = patched
+        try:
+            r = await server.git_checkpoint(target, "t06 identity")
+        finally:
+            _s._run_git = original
+        check("Identity error specifically returned",
+              "user identity is not configured" in r, r[:400])
+        check("Not reported as success",
+              "Committed:" not in r, r[:400])
+    import shutil
+    shutil.rmtree(empty_home, ignore_errors=True)
+
+
+async def test_git_staged_work_extended():
+    print("\n[Test GIT-04] git_checkpoint — staged 'A' file detected (T06)")
+    with tempfile.TemporaryDirectory() as d:
+        subprocess.run(["git", "init", "-q"], cwd=d, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=d, check=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=d, check=True)
+        seed = os.path.join(d, "seed.py")
+        with open(seed, "w") as fh:
+            fh.write("# seed\n")
+        subprocess.run(["git", "add", "."], cwd=d, check=True)
+        subprocess.run(["git", "commit", "-qm", "init"], cwd=d, check=True)
+        # New file with no worktree change (A with space)
+        new_file = os.path.join(d, "user_new.py")
+        with open(new_file, "w") as fh:
+            fh.write("# user\n")
+        subprocess.run(["git", "add", "user_new.py"], cwd=d, check=True)
+        # Modified target (unstaged)
+        target = os.path.join(d, "agent.py")
+        with open(target, "w") as fh:
+            fh.write("# agent\n")
+        r = await server.git_checkpoint(target, "t06 staged")
+        check("Staged A file detected",
+              "Unrelated staged" in r or "ERROR" in r.upper(), r[:300])
+        # Ensure the user's file is still staged (untouched)
+        status = subprocess.run(["git", "status", "--porcelain"],
+                                cwd=d, capture_output=True, text=True)
+        check("user_new.py still staged",
+              "A  user_new.py" in status.stdout, status.stdout[:300])
+
+
+async def test_git_commit_only_target():
+    print("\n[Test GIT-05] git_checkpoint — commits only the target (T06)")
+    with tempfile.TemporaryDirectory() as d:
+        subprocess.run(["git", "init", "-q"], cwd=d, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=d, check=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=d, check=True)
+        seed = os.path.join(d, "seed.py")
+        with open(seed, "w") as fh:
+            fh.write("# seed\n")
+        subprocess.run(["git", "add", "."], cwd=d, check=True)
+        subprocess.run(["git", "commit", "-qm", "init"], cwd=d, check=True)
+        target = os.path.join(d, "target.py")
+        with open(target, "w") as fh:
+            fh.write("# target\n")
+        r = await server.git_checkpoint(target, "t06 only target")
+        show = subprocess.run(["git", "show", "--name-only", "--format="],
+                              cwd=d, capture_output=True, text=True)
+        check("Only target.py committed",
+              show.stdout.strip() == "target.py",
+              show.stdout.strip())
+        check("commit_id present", "commit_id:" in r, r[:300])
+
+
+async def test_git_response_bounded():
+    print("\n[Test GIT-06] git_checkpoint — response bounded at 4000 (T06)")
+    with tempfile.TemporaryDirectory() as d:
+        subprocess.run(["git", "init", "-q"], cwd=d, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=d, check=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=d, check=True)
+        seed = os.path.join(d, "seed.py")
+        with open(seed, "w") as fh:
+            fh.write("# seed\n")
+        subprocess.run(["git", "add", "."], cwd=d, check=True)
+        subprocess.run(["git", "commit", "-qm", "init"], cwd=d, check=True)
+        target = os.path.join(d, "one.py")
+        with open(target, "w") as fh:
+            fh.write("# one\n")
+        r = await server.git_checkpoint(target, "t06 bounded")
+        check("Response <= 4000", len(r) <= 4000, f"len={len(r)}")
+        check("commit_id present", "commit_id:" in r, r[:400])
+
+
+async def test_git_long_summary_bounded():
+    print("\n[Test GIT-07] git_checkpoint — long summary bounded (T06)")
+    with tempfile.TemporaryDirectory() as d:
+        subprocess.run(["git", "init", "-q"], cwd=d, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=d, check=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=d, check=True)
+        seed = os.path.join(d, "seed.py")
+        with open(seed, "w") as fh:
+            fh.write("# seed\n")
+        subprocess.run(["git", "add", "."], cwd=d, check=True)
+        subprocess.run(["git", "commit", "-qm", "init"], cwd=d, check=True)
+        target = os.path.join(d, "one.py")
+        with open(target, "w") as fh:
+            fh.write("# one\n")
+        r = await server.git_checkpoint(target, "x" * 5000)
+        check("Response <= 4000", len(r) <= 4000, f"len={len(r)}")
+        check("commit_id survived",
+              "commit_id:" in r and len(r.split("commit_id:")[1].split()[0]) == 40,
+              r[:400])
+
+
+# ═══════════════════════════════════════════════════════════
+# T07 — rollback_show
+# ═══════════════════════════════════════════════════════════
+
+async def test_rollback_three_categories():
+    print("\n[Test ROLL-01] rollback_show — three categories (T07)")
+    with tempfile.TemporaryDirectory() as d:
+        subprocess.run(["git", "init", "-q"], cwd=d, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=d, check=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=d, check=True)
+        # Tracked file, then one staged edit + one unstaged edit
+        tracked = os.path.join(d, "tracked.py")
+        with open(tracked, "w") as fh:
+            fh.write("v1\n")
+        subprocess.run(["git", "add", "."], cwd=d, check=True)
+        subprocess.run(["git", "commit", "-qm", "init"], cwd=d, check=True)
+        # Staged change
+        with open(tracked, "w") as fh:
+            fh.write("v2-staged\n")
+        subprocess.run(["git", "add", "tracked.py"], cwd=d, check=True)
+        # Unstaged append
+        with open(tracked, "a") as fh:
+            fh.write("v3-unstaged\n")
+        # Untracked file
+        with open(os.path.join(d, "new.py"), "w") as fh:
+            fh.write("# untracked\n")
+        r = await server.rollback_show(d)
+        check("Staged section present", "Staged changes" in r, r[:500])
+        check("Unstaged section present", "Unstaged changes" in r, r[:800])
+        check("Untracked section present", "Untracked" in r, r[:800])
+        check("tracked.py appears in report", "tracked.py" in r, r[:800])
+        check("new.py appears in report", "new.py" in r, r[:800])
+
+
+async def test_rollback_no_mutation():
+    print("\n[Test ROLL-02] rollback_show — never mutates the repo (T07)")
+    with tempfile.TemporaryDirectory() as d:
+        subprocess.run(["git", "init", "-q"], cwd=d, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=d, check=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=d, check=True)
+        seed = os.path.join(d, "seed.py")
+        with open(seed, "w") as fh:
+            fh.write("# seed\n")
+        subprocess.run(["git", "add", "."], cwd=d, check=True)
+        subprocess.run(["git", "commit", "-qm", "init"], cwd=d, check=True)
+        head_before = subprocess.run(["git", "rev-parse", "HEAD"], cwd=d,
+                                     capture_output=True, text=True).stdout
+        with open(seed, "a") as fh:
+            fh.write("# change\n")
+        with open(os.path.join(d, "extra.py"), "w") as fh:
+            fh.write("# extra\n")
+        r = await server.rollback_show(d)
+        head_after = subprocess.run(["git", "rev-parse", "HEAD"], cwd=d,
+                                    capture_output=True, text=True).stdout
+        check("HEAD unchanged", head_before == head_after)
+        check("Working file intact",
+              open(seed).read() == "# seed\n# change\n")
+        check("Untracked file intact",
+              os.path.exists(os.path.join(d, "extra.py")))
+
+
+async def test_rollback_not_a_repo():
+    print("\n[Test ROLL-03] rollback_show — not a repo (T07)")
+    with tempfile.TemporaryDirectory() as d:
+        r = await server.rollback_show(d)
+        check("Not-a-repo reported as error",
+              "ERROR" in r.upper() or "not a git" in r.lower(), r[:300])
+        check("Not falsely clean",
+              "(none)" not in r[:200] or "ERROR" in r.upper(), r[:300])
+
+
+async def test_rollback_bounded():
+    print("\n[Test ROLL-04] rollback_show — response bounded at 4000 (T07)")
+    with tempfile.TemporaryDirectory() as d:
+        subprocess.run(["git", "init", "-q"], cwd=d, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=d, check=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=d, check=True)
+        # Many untracked files with long names
+        for i in range(80):
+            with open(os.path.join(d, f"untracked_file_with_long_name_{i:03d}.py"), "w") as fh:
+                fh.write("# x\n")
+        r = await server.rollback_show(d)
+        check("Response <= 4000", len(r) <= 4000, f"len={len(r)}")
+
+
+async def test_rollback_manual_command_present():
+    print("\n[Test ROLL-05] rollback_show — manual commands shown (T07)")
+    with tempfile.TemporaryDirectory() as d:
+        subprocess.run(["git", "init", "-q"], cwd=d, check=True)
+        r = await server.rollback_show(d)
+        check("Manual rollback warning present",
+              "manual" in r.lower(), r[:600])
+        check("git reset command shown",
+              "git reset --hard" in r, r[:1000])
+
+
+async def test_rollback_no_hooks_or_external_diff():
+    print("\n[Test ROLL-06] rollback_show — no ext-diff side effects (T07)")
+    # Verifies the read-only flags prevent hook / ext-diff execution.
+    with tempfile.TemporaryDirectory() as d:
+        subprocess.run(["git", "init", "-q"], cwd=d, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=d, check=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=d, check=True)
+        # Set an external diff that would write a marker file if invoked
+        marker = os.path.join(d, "HOOK_RAN")
+        hook_script = os.path.join(d, "ext_diff.sh")
+        with open(hook_script, "w") as fh:
+            fh.write(f"#!/bin/sh\ntouch {marker}\nexit 0\n")
+        os.chmod(hook_script, 0o755)
+        subprocess.run(["git", "config", "diff.external", hook_script], cwd=d, check=True)
+        seed = os.path.join(d, "a.py")
+        with open(seed, "w") as fh:
+            fh.write("# a\n")
+        subprocess.run(["git", "add", "."], cwd=d, check=True)
+        subprocess.run(["git", "commit", "-qm", "init"], cwd=d, check=True)
+        with open(seed, "a") as fh:
+            fh.write("# change\n")
+        r = await server.rollback_show(d)
+        check("External diff was not invoked",
+              not os.path.exists(marker),
+              f"marker={os.path.exists(marker)}")
+
+
 async def main():
     print("=" * 60)
     print("Harness-Optimizer Fix Verification")
@@ -1217,6 +1511,19 @@ async def main():
     await test_lint_no_generic_line_fallback()
     await test_lint_path_disambiguation()
     await test_lint_source_change_during_compile_noted()
+    await test_git_subdirectory_path()
+    await test_git_outside_repo()
+    await test_git_missing_identity()
+    await test_git_staged_work_extended()
+    await test_git_commit_only_target()
+    await test_git_response_bounded()
+    await test_git_long_summary_bounded()
+    await test_rollback_three_categories()
+    await test_rollback_no_mutation()
+    await test_rollback_not_a_repo()
+    await test_rollback_bounded()
+    await test_rollback_manual_command_present()
+    await test_rollback_no_hooks_or_external_diff()
 
 
     print("\n" + "=" * 60)
