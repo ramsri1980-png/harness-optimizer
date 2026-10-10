@@ -40,12 +40,23 @@ STUB_OUT = "/tmp/opencode/ctx_spike/request.jsonl"
 STUB_READY = "listening on 127.0.0.1:8123"
 
 MARKER = "[HARNESS REPOSITORY CONTEXT — reference data]"
+FOOTER = "[/HARNESS REPOSITORY CONTEXT]"
 FIXTURE_SNIPPET = "Hello from the CTX fixture."
 PROMPT = "Please look at ctx_fixtures/hello.txt and tell me what it says."
 GEN_PROMPT = "hi, how are you today?"
 MISSING_PROMPT = "Please look at ctx_fixtures/nonexistent.py and tell me what it says."
 LIB_PROMPT = "Please look at ctx_fixtures/lib/util.py and tell me what it says."
 MAP_PROMPT = "How is this repository structured? Give me a brief overview."
+# CTX-12: a self-contained snippet — it has a `def` and a `print` but names
+# no file, so it must not trigger a repo lookup.
+SNIPPET_PROMPT = (
+    "Given this snippet, what does it print?\n"
+    "def f(x): return x * 2\n"
+    "print(f(21))"
+)
+# CTX-16: generous ceiling on the ranked-map packet in UTF-8 bytes.
+# 1500 tokens x ~4 chars/token = ~6000 chars, well under 8 KiB.
+MAP_PACKET_MAX_BYTES = 8 * 1024
 # Ranked-map entries render as `<relpath>:L<n> <kind> <name>`; the brief's
 # "file:L<n> def <name>" means the file path may carry directories/extension.
 MAP_DEF_LINE_RE = re.compile(r"\S+:L\d+ def \w+")
@@ -351,6 +362,20 @@ def _run_prompt(env, workspace, prompt, label):
     return bodies, raw
 
 
+def _count_workers():
+    """Return the number of live context_worker.py processes."""
+    try:
+        out = subprocess.run(
+            ["pgrep", "-f", WORKER_PROC],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return len([line for line in out.stdout.splitlines() if line.strip()])
+    except Exception:
+        return 0
+
+
 def _body_text(body):
     """Every text part of a captured body, decoded (no JSON escaping)."""
     if not isinstance(body, dict):
@@ -386,6 +411,18 @@ def _packet_count(primary):
         if isinstance(message, dict)
         and any(MARKER in text for text in _message_texts(message))
     )
+
+
+def _packet_text(primary):
+    """Text between HEADER and FOOTER of the first packet in a body."""
+    text = _body_text(primary)
+    start = text.find(MARKER)
+    if start < 0:
+        return None
+    end = text.find(FOOTER, start)
+    if end < 0:
+        return None
+    return text[start:end]
 
 
 def _check_api06(env, workspace, first_source, first_digest):
@@ -491,6 +528,196 @@ def _check_api07(pre_pids):
         "CTX-API-07: no orphan context_worker.py after the MAP run",
         ok,
         "workers before=%d after=%d" % (len(pre_pids), len(post)),
+    )
+
+
+def _run_prompt_with_env(env, workspace, prompt, label, env_overrides):
+    """Sibling of ``_run_prompt``: merge ``env_overrides`` into a *copy* of env."""
+    child_env = dict(env)
+    child_env.update(env_overrides or {})
+    offset = os.path.getsize(STUB_OUT) if os.path.isfile(STUB_OUT) else 0
+    proc = subprocess.run(
+        ["opencode", "run", "--standalone", "--auto", "-m", "stub/stub-1", prompt],
+        cwd=workspace,
+        env=child_env,
+        capture_output=True,
+        timeout=RUN_TIMEOUT,
+    )
+    print("[opencode] %s run exit=%s" % (label, proc.returncode))
+
+    bodies, raw = _read_appended(offset)
+    print("[stub] captured %d request body/bodies from the %s run" % (len(bodies), label))
+    return proc, bodies, raw
+
+
+def _check_ctx07(env, workspace):
+    """CTX-07: HARNESS_CTX=off disables injection entirely."""
+    proc, bodies, _raw = _run_prompt_with_env(
+        env, workspace, PROMPT, "ctx07-kill-switch", {"HARNESS_CTX": "off"}
+    )
+    primary = _primary_body(bodies)
+    text = _body_text(primary)
+    marker_present = MARKER in text
+    source_line_present = "# source:" in text
+    ok = (
+        len(bodies) > 0
+        and primary is not None
+        and not marker_present
+        and not source_line_present
+        and proc.returncode == 0
+    )
+    return _check(
+        "CTX-07: HARNESS_CTX=off disables injection entirely",
+        ok,
+        "captured=%d marker=%s source_line=%s exit=%s"
+        % (len(bodies), marker_present, source_line_present, proc.returncode),
+    )
+
+
+def _check_ctx12(env, workspace):
+    """CTX-12: a self-contained snippet must not trigger repo lookup."""
+    pre = _count_workers()
+    bodies, raw = _run_prompt(env, workspace, SNIPPET_PROMPT, "ctx12-snippet")
+    time.sleep(1)
+    post = _count_workers()
+    primary = _primary_body(bodies)
+    text = _body_text(primary)
+    marker_present = MARKER in text
+    source_line_present = "# source:" in text
+    marker_in_raw = MARKER in raw.decode("utf-8", "replace")
+    ok = (
+        len(bodies) > 0
+        and primary is not None
+        and not marker_present
+        and not marker_in_raw
+        and not source_line_present
+        and pre == 0
+        and post == 0
+    )
+    return _check(
+        "CTX-12: self-contained snippet injects nothing and spawns no worker",
+        ok,
+        "captured=%d marker=%s source_line=%s workers before=%d after=%d"
+        % (len(bodies), marker_present, source_line_present, pre, post),
+    )
+
+
+def _check_ctx13(env, workspace):
+    """CTX-13: naming a known file gates FOCUSED, never MAP."""
+    pre = _count_workers()
+    bodies, _raw = _run_prompt(env, workspace, PROMPT, "ctx13-focused")
+    time.sleep(1)
+    post = _count_workers()
+    primary = _primary_body(bodies)
+    text = _body_text(primary)
+    focused_packet = "# source: ctx_fixtures/hello.txt" in text
+    ranked_map = "# source: <ranked-map>" in text
+    ok = (
+        len(bodies) > 0
+        and primary is not None
+        and focused_packet
+        and not ranked_map
+        and pre == 0
+        and post == 0
+    )
+    return _check(
+        "CTX-13: known file gates FOCUSED (file packet, no ranked map, no worker)",
+        ok,
+        "captured=%d focused_packet=%s ranked_map=%s workers before=%d after=%d"
+        % (len(bodies), focused_packet, ranked_map, pre, post),
+    )
+
+
+def _check_ctx16(env, workspace):
+    """CTX-16: the MAP packet is present, budgeted, and carries real entries."""
+    bodies, _raw = _run_prompt(env, workspace, MAP_PROMPT, "ctx16-map-budget")
+    primary = _primary_body(bodies)
+    text = _body_text(primary)
+    ranked_map = "# source: <ranked-map>" in text
+    packet = _packet_text(primary)
+    packet_bytes = len(packet.encode("utf-8")) if packet is not None else -1
+    defs = MAP_DEF_LINE_RE.findall(packet) if packet is not None else []
+    ok = (
+        len(bodies) > 0
+        and primary is not None
+        and ranked_map
+        and packet is not None
+        and 0 < packet_bytes <= MAP_PACKET_MAX_BYTES
+        and len(defs) >= 3
+    )
+    return _check(
+        "CTX-16: ranked-map packet is present, <= 8 KiB, with >= 3 def entries",
+        ok,
+        "captured=%d ranked_map=%s packet_bytes=%d defs=%d"
+        % (len(bodies), ranked_map, packet_bytes, len(defs)),
+    )
+
+
+def _check_ctx17(env, workspace):
+    """CTX-17: ten repeated general turns stay NONE — no packet, no worker."""
+    marker_runs = 0
+    total_bodies = 0
+    for turn in range(10):
+        bodies, _raw = _run_prompt(env, workspace, GEN_PROMPT, "ctx17-general-%d" % (turn + 1))
+        total_bodies += len(bodies)
+        primary = _primary_body(bodies)
+        if primary is not None and MARKER in _body_text(primary):
+            marker_runs += 1
+    time.sleep(1)
+    workers = _count_workers()
+    ok = total_bodies > 0 and marker_runs == 0 and workers == 0
+    return _check(
+        "CTX-17: ten general turns inject nothing and spawn no worker",
+        ok,
+        "runs=10 captured=%d marker_runs=%d workers=%d" % (total_bodies, marker_runs, workers),
+    )
+
+
+def _check_ctx06(env, workspace, plugin_dir):
+    """CTX-06: an unavailable worker fails open — no map, no crash, no orphan."""
+    worker_path = os.path.join(plugin_dir, WORKER_PROC)
+    hidden_path = worker_path + ".bak"
+    if not os.path.isfile(worker_path):
+        return _check(
+            "CTX-06: missing worker fails open (no map, no crash, no orphan)",
+            False,
+            "context_worker.py not found in %s — cannot hide it" % plugin_dir,
+        )
+
+    os.rename(worker_path, hidden_path)
+    try:
+        offset = os.path.getsize(STUB_OUT) if os.path.isfile(STUB_OUT) else 0
+        proc = subprocess.run(
+            ["opencode", "run", "--standalone", "--auto", "-m", "stub/stub-1", MAP_PROMPT],
+            cwd=workspace,
+            env=env,
+            capture_output=True,
+            timeout=RUN_TIMEOUT,
+        )
+        print("[opencode] ctx06-worker-hidden run exit=%s" % proc.returncode)
+        bodies, _raw = _read_appended(offset)
+        print("[stub] captured %d request body/bodies from the ctx06 run" % len(bodies))
+        time.sleep(2)
+        workers = _count_workers()
+    finally:
+        if os.path.isfile(hidden_path):
+            os.rename(hidden_path, worker_path)
+
+    primary = _primary_body(bodies)
+    text = _body_text(primary)
+    ranked_map = "# source: <ranked-map>" in text
+    ok = (
+        len(bodies) > 0
+        and primary is not None
+        and not ranked_map
+        and proc.returncode == 0
+        and workers == 0
+    )
+    return _check(
+        "CTX-06: missing worker fails open (no map, no crash, no orphan)",
+        ok,
+        "captured=%d ranked_map=%s exit=%s workers=%d"
+        % (len(bodies), ranked_map, proc.returncode, workers),
     )
 
 
@@ -677,6 +904,15 @@ def main():
         pre_worker_pids = _worker_pids()
         ok &= _check_api04(env, workspace)
         ok &= _check_api07(pre_worker_pids)
+
+        # CTX Days 6-7 checks: kill switch, snippet gate, FOCUSED-vs-MAP,
+        # MAP budget, repeated general turns, and worker fail-open.
+        ok &= _check_ctx07(env, workspace)
+        ok &= _check_ctx12(env, workspace)
+        ok &= _check_ctx13(env, workspace)
+        ok &= _check_ctx16(env, workspace)
+        ok &= _check_ctx17(env, workspace)
+        ok &= _check_ctx06(env, workspace, plugin_dir)
 
         print("\n%d/%d checks passed" % (sum(1 for _, c in check_results if c), len(check_results)))
         return 0 if ok else 1
