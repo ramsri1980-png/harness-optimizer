@@ -81,6 +81,7 @@ async def emit_metric(ctx: Context, tool: str, saved: int, baseline: int, actual
 @register("get_repo_skeleton")
 async def get_repo_skeleton(repo_path: str = ".", max_files: int = 500,
                             mode: str = "outline", max_tokens: int = 1500):
+    """AST-ranked repo map (Python/JS/TS/TSX). mode='ranked' for repository-wide navigation, 'outline' for known files."""
     import ast
     if mode not in ("outline", "ranked"):
         return f"ERROR: unsupported mode '{mode}' — use 'outline' or 'ranked'"
@@ -292,34 +293,7 @@ def _enclosing_definition(lines, start_line):
 @register("rip_file_lines")
 async def rip_file_lines(file_path: str, start_line: int, end_line: int, ctx: Context,
                          context: str = "raw") -> str:
-    """View a precise line window from a file. Use this instead of reading
-    full files. Line numbers are 1-indexed and printed for reference.
-
-    Response format:
-        --- Lines A to B of T ---
-        # sha256: <hex of raw file bytes>
-        A: <source line>
-        ...
-
-    The sha256 line fingerprints the exact bytes the excerpt was built
-    from, so a later rip can be checked for staleness.
-
-    context="raw" (default) returns exactly the requested range.
-    context="enclosing" expands the range to the whole enclosing
-    class/function (up to 500 lines) when the request falls inside one.
-
-    Bounds: start_line < 1 or end_line < start_line is an ERROR; a
-    start beyond EOF is an ERROR; an end beyond EOF is silently clipped
-    and the header reports the actual returned bounds. An empty file
-    yields the header "Lines 1 to 0 of 0" plus the sha256 of the empty
-    string (e3b0c442...b855).
-
-    Whitespace: only the line terminator is removed when splitting
-    (\r\n or \n); trailing spaces/tabs are preserved in the output and
-    CRLF input is emitted as LF.
-
-    Output is capped at 4000 characters; oversized excerpts keep the
-    first and last 20 source lines with a truncation marker."""
+    """View a 1-indexed line window with sha256 fingerprint (up to 4000 chars). Use context='raw' for exact lines or 'enclosing' for whole definitions."""
     file_path = os.path.expanduser(file_path)
     if not os.path.exists(file_path):
         return f"Error: File {file_path} not found."
@@ -472,17 +446,7 @@ async def find_dependent_references(
     symbol_file: str = "",
     depth: int = 2,
 ) -> str:
-    """Bounded search for a symbol in Python files.
-
-    Substring search, NOT semantic dependency analysis. Matches any
-    line containing the symbol text, including comments and strings.
-    Use as a hint, not a verdict.
-
-    Modes:
-      text    (default) — Substring search across lines.
-      symbols — Python AST-indexed definitions and references.
-      related — Bounded directed neighborhood from a seed definition.
-    """
+    """Bounded search for symbol occurrences in Python files. Substring search in 'text' mode (not semantic); AST-indexed in 'symbols' and 'related' modes."""
     if mode not in {"text", "symbols", "related"}:
         return f"ERROR: unsupported mode '{mode}' \u2014 use 'text', 'symbols', or 'related'"
 
@@ -1062,23 +1026,7 @@ def _trim_middle(lines, budget, marker="    ... [truncated] ..."):
 @register("apply_search_replace")
 async def apply_search_replace(file_path: str, search_block: str, replace_block: str,
                                expected_sha256: str = None) -> str:
-    """Replace the exact `search_block` with `replace_block` once.
-
-    Matching is a strict, case-sensitive substring match against the
-    file's decoded text; `search_block` and `replace_block` are
-    converted to the file's dominant newline before matching. Bytes
-    outside the replaced range are never rewritten, so a file with
-    mixed line endings keeps its minority convention intact.
-    Zero matches, overlapping matches and more than one match are
-    errors - callers must add context to disambiguate.
-
-    expected_sha256 (optional) is a stale-content guard: when given,
-    the file's current sha256 must match or the edit is refused and
-    nothing is written.
-
-    The file's dominant newline convention and POSIX mode are
-    preserved, and the write is atomic (temp file in the same
-    directory + os.replace)."""
+    """Atomically replace one exact match of search_block with replace_block. Refuses ambiguous or missing matches; optional expected_sha256 prevents stale edits."""
     path = os.path.expanduser(file_path)
     if not os.path.exists(path):
         return f"ERROR: File not found: {path}"
@@ -1240,13 +1188,7 @@ def _path_matches(cand_path, target_path):
 
 @register("lint_file")
 async def lint_file(file_path: str) -> str:
-    """Python syntax check only (py_compile). Not a linter, type checker, or
-    behavioral test runner. Returns one of:
-      - OK: ... on successful Python syntax check
-      - FAIL: ... on syntax error or missing file
-      - SKIPPED: unsupported file type for non-.py files — use the
-        repository's own configured checks instead.
-    """
+    """Python syntax check only via py_compile. Not a linter, type checker, or test runner; non-Python files are skipped."""
     path = os.path.expanduser(file_path)
     ext = os.path.splitext(path)[1].lower()
 
@@ -1535,11 +1477,7 @@ def _bound_4000(text: str) -> str:
 
 @register("git_checkpoint")
 async def git_checkpoint(file_path: str, change_summary: str) -> str:
-    """Commit ONLY file_path under a [harness]-prefixed message.
-
-    Refuses when unrelated files are staged, so the user's own work is
-    never swept into our commit. Never modifies git config.
-    """
+    """Commit ONLY file_path under a [harness]-prefixed message. Refuses when unrelated staged or unstaged changes exist; never modifies git config."""
     if len(change_summary) > 200:
         change_summary = change_summary[:197] + "..."
 
@@ -1641,8 +1579,7 @@ async def git_checkpoint(file_path: str, change_summary: str) -> str:
 
 @register("rollback_show")
 async def rollback_show(repo_path: str) -> str:
-    """READ-ONLY. Shows what would be lost if the user resets the repo.
-    Does NOT execute any rollback. Presents copyable commands."""
+    """READ-ONLY. Shows what would be lost on repo reset and copyable commands. Does NOT execute rollbacks or modify repository state."""
     try:
         # ── T07-2: canonical repository root discovery ──
         real_root = os.path.realpath(os.path.abspath(repo_path))
@@ -1765,18 +1702,145 @@ def _bypass_reason(parts: list):
             return "refused: git config --global is not permitted via execute_and_capture"
     return None
 
+
+# ── Noise filtering for execute_and_capture ────────────────
+_NOISE_SUPPORTED_TOOLS = {"pytest", "npm", "yarn", "pnpm", "docker", "go", "cargo"}
+
+
+def _strip_ansi(text: str) -> str:
+    return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text)
+
+
+def _collapse_cr(text: str) -> str:
+    lines = text.split("\n")
+    collapsed = []
+    for line in lines:
+        if "\r" in line:
+            stripped = line.rstrip("\r")
+            if stripped:
+                line = stripped.rsplit("\r", 1)[-1]
+            else:
+                line = ""
+        collapsed.append(line)
+    return "\n".join(collapsed)
+
+
+def _detect_tool(parts: list, text: str = "") -> str:
+    if not parts:
+        return ""
+    tool = os.path.basename(parts[0])
+    if tool in _NOISE_SUPPORTED_TOOLS:
+        return tool
+    if tool in ("python", "python3"):
+        for arg in parts[1:]:
+            base = os.path.basename(arg)
+            if base in _NOISE_SUPPORTED_TOOLS:
+                return base
+        lower = text.lower()
+        if "npm warn" in lower or "npm err!" in lower:
+            return "npm"
+        if "yarn " in lower:
+            return "yarn"
+        if "pnpm " in lower:
+            return "pnpm"
+    return tool
+
+
+def _apply_noise_filter(text: str, tool: str) -> tuple[str, int]:
+    lines = text.splitlines()
+    kept = []
+    dropped = 0
+
+    if tool == "pytest":
+        pytest_keep = ("FAILED", "ERROR", "short test summary", "passed", "failed", "skipped", "warnings summary")
+        for line in lines:
+            stripped = line.strip()
+            if any(k in line for k in pytest_keep):
+                kept.append(line)
+                continue
+            if not stripped:
+                dropped += 1
+                continue
+            if "PASSED" in line:
+                dropped += 1
+                continue
+            if re.match(r"^={3,}.*={3,}$", stripped):
+                dropped += 1
+                continue
+            if re.search(r"\[\s*\d+%\s*\]$", stripped) or re.match(r"^[\.sFExXw]+$", stripped):
+                dropped += 1
+                continue
+            kept.append(line)
+
+    elif tool in ("npm", "yarn", "pnpm"):
+        npm_keep_errors = ("npm ERR!", "ERR!", "error", "Error")
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                dropped += 1
+                continue
+            if "⸨" in line or "⸩" in line:
+                dropped += 1
+                continue
+            if "warn deprecated" in line.lower() or ("deprecated" in line.lower() and ("npm" in line.lower() or "warn" in line.lower())):
+                dropped += 1
+                continue
+            if any(k in line for k in npm_keep_errors) or "npm WARN" in line:
+                kept.append(line)
+                continue
+            kept.append(line)
+
+    elif tool == "docker":
+        docker_keep = ("ERROR", "failed")
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped:
+                dropped += 1
+                continue
+            if any(k in line for k in docker_keep):
+                kept.append(line)
+                continue
+            if (re.search(r"^[0-9a-fA-F]{12}: (Pulling fs layer|Downloading|Extracting|Waiting|Verifying Checksum|Download complete|Pull complete)", stripped)
+                or re.search(r"^\s*\[[=> ]+\]", stripped)
+                or re.search(r"^(Digest|Status): ", stripped)):
+                dropped += 1
+                continue
+            if re.search(r"^Step \d+/\d+", stripped):
+                has_adj_err = False
+                for j in (i - 1, i + 1):
+                    if 0 <= j < len(lines) and any(k in lines[j] for k in docker_keep):
+                        has_adj_err = True
+                        break
+                if not has_adj_err:
+                    dropped += 1
+                    continue
+            kept.append(line)
+
+    elif tool in ("go", "cargo"):
+        gc_keep = ("error", "warning", "fail", "test failed")
+        drop_words = ("Compiling", "Downloading", "Updating")
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                dropped += 1
+                continue
+            if any(k in line.lower() for k in gc_keep):
+                kept.append(line)
+                continue
+            if any(stripped.startswith(w) or f" {w} " in line for w in drop_words):
+                dropped += 1
+                continue
+            kept.append(line)
+    else:
+        return text, 0
+
+    return "\n".join(kept), dropped
+
+
 @register("execute_and_capture")
 async def execute_and_capture(command: str, timeout_seconds: int = 15,
                               log_path: str = "") -> str:
-    """Run a whitelisted command with bounded, streaming capture.
-
-    stdout and stderr are read in 4 KiB chunks into a shared byte
-    budget of MAX_OUTPUT_CHARS * 4 (four bytes per character of UTF-8
-    headroom). Once the budget is spent the streams keep being drained
-    but are no longer stored, so the child never blocks on a full pipe.
-    Partial output survives a timeout, and an optional `log_path`
-    receives the full, uncapped stream while the response stays
-    bounded."""
+    """Run an allowlisted shell command with bounded streaming capture. Output is line- and char-capped; partial output survives timeouts."""
     import shlex
     import signal
     import subprocess
@@ -1889,6 +1953,17 @@ async def execute_and_capture(command: str, timeout_seconds: int = 15,
     output = (stdout_bytes.decode("utf-8", errors="replace")
               + "\n"
               + stderr_bytes.decode("utf-8", errors="replace"))
+
+    # Universal filters: strip ANSI escape sequences and collapse CR
+    output = _strip_ansi(output)
+    output = _collapse_cr(output)
+
+    # Tool-specific noise filter before line/char caps
+    noise_lines_dropped = 0
+    tool = _detect_tool(parts, output)
+    if tool in _NOISE_SUPPORTED_TOOLS:
+        output, noise_lines_dropped = _apply_noise_filter(output, tool)
+
     lines = output.splitlines()
     over_lines = len(lines) > MAX_OUTPUT_LINES
 
@@ -1931,6 +2006,8 @@ async def execute_and_capture(command: str, timeout_seconds: int = 15,
         f"Timed out: {'yes' if timed_out else 'no'}",
         f"Output truncated: {'yes' if truncated else 'no'}",
     ]
+    if noise_lines_dropped > 0:
+        response.append(f"(noise filter: {noise_lines_dropped} lines dropped)")
     if truncated:
         response.append(
             f"(output truncated to "
@@ -1963,11 +2040,7 @@ def _quote_ident(name: str) -> str:
 
 @register("inspect_database_schema")
 async def inspect_database_schema(db_path: str, tables: str = "") -> str:
-    """Read-only. Lists SQLite tables with columns, PKs, FKs, and indexes.
-
-    Never reads application data: only sqlite_master and PRAGMA queries
-    run, over a `mode=ro` URI connection that cannot write. Optional
-    `tables` is a comma-separated list of exact table names ("" = all)."""
+    """Read-only SQLite schema inspection listing tables, columns, keys, and indexes. Uses mode=ro connection and never reads application data."""
     import urllib.parse
 
     db_path = os.path.expanduser(db_path)

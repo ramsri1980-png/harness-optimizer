@@ -2652,6 +2652,103 @@ async def test_exec_allowlist_unchanged():
           "refused" in wr and "dangerous pattern" in wr, wr[:300])
 
 
+async def test_exec_noise_filter_pytest():
+    print("\n[Test EXEC-13] execute_and_capture — pytest noise filter")
+    with tempfile.NamedTemporaryFile(suffix="_test.py", mode="w", delete=False) as f:
+        f.write("def test_ok():\n    assert True\n\ndef test_bad():\n    assert False\n")
+        tmp_name = f.name
+    try:
+        out = await server.execute_and_capture(f"pytest {tmp_name}")
+        check("EXEC-13: noise filter line emitted with N>0",
+              re.search(r"\(noise filter: [1-9]\d* lines dropped\)", out) is not None,
+              out[:400])
+        check("EXEC-13: FAILED appears", "FAILED" in out, out)
+        check("EXEC-13: passing-test dots absent",
+              not re.search(r"\s+\.[\.F\s]*\[", out) and "PASSED" not in out,
+              out)
+        check("EXEC-13: Exit code prefix preserved",
+              "Exit code: 1" in out, out[:200])
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+
+
+async def test_exec_noise_filter_npm():
+    print("\n[Test EXEC-14] execute_and_capture — npm noise filter")
+    cmd = (
+        'python3 -c "'
+        'import sys; '
+        'print(\'npm warn deprecated request@2.88.2: this package is deprecated\'); '
+        'print(\'npm ERR! code 1\'); '
+        'print(\'npm ERR! path /app\'); '
+        'sys.exit(1)"'
+    )
+    out = await server.execute_and_capture(cmd)
+    check("EXEC-14: noise filter line emitted",
+          re.search(r"\(noise filter: [1-9]\d* lines dropped\)", out) is not None,
+          out[:400])
+    check("EXEC-14: deprecation dropped",
+          "npm warn deprecated" not in out and "this package is deprecated" not in out,
+          out)
+    check("EXEC-14: error preserved",
+          "npm ERR! code 1" in out and "npm ERR! path /app" in out,
+          out)
+    check("EXEC-14: Exit code preserved",
+          "Exit code: 1" in out, out[:200])
+
+
+async def test_exec_ansi_and_cr_stripped():
+    print("\n[Test EXEC-15] execute_and_capture — ANSI and CR stripped")
+    cmd = (
+        'python3 -c "'
+        'import sys; '
+        'sys.stdout.write(\'\\x1b[31mred_error\\x1b[0m\\nstep1\\rstep2\\rfinal_payload\\n\')"'
+    )
+    out = await server.execute_and_capture(cmd)
+    check("EXEC-15: no escape characters remain", "\x1b" not in out, out)
+    check("EXEC-15: final CR segment preserved", "final_payload" in out, out)
+    check("EXEC-15: overwritten CR segments dropped",
+          "step1" not in out and "step2" not in out, out)
+
+
+async def test_exec_unknown_tool_unfiltered():
+    print("\n[Test EXEC-16] execute_and_capture — unknown tool unfiltered")
+    cmd = 'python3 -c "print(\'normal output line 1\'); print(\'normal output line 2\')"'
+    out = await server.execute_and_capture(cmd)
+    check("EXEC-16: no noise filter line emitted", "noise filter:" not in out, out[:400])
+    check("EXEC-16: original output preserved",
+          "normal output line 1" in out and "normal output line 2" in out, out)
+    check("EXEC-16: exit code 0 reported", "Exit code: 0" in out, out[:200])
+
+
+async def test_tool_docstring_size_reduced():
+    print("\n[Test DOCS-01] tool docstrings compressed")
+    import inspect
+    names = [
+        "get_repo_skeleton",
+        "rip_file_lines",
+        "find_dependent_references",
+        "apply_search_replace",
+        "lint_file",
+        "git_checkpoint",
+        "rollback_show",
+        "execute_and_capture",
+        "inspect_database_schema",
+    ]
+    total_chars = 0
+    for name in names:
+        fn = getattr(server, name, None)
+        check(f"DOCS-01: {name} exists", fn is not None)
+        ds = inspect.getdoc(fn) or ""
+        total_chars += len(ds)
+        if name == "get_repo_skeleton":
+            check("DOCS-01: get_repo_skeleton has non-empty docstring (>= 80 chars)",
+                  len(ds) >= 80, f"actual={len(ds)}")
+
+    check("DOCS-01: total docstring chars <= 1700",
+          total_chars <= 1700, f"actual={total_chars}")
+
+
 async def main():
     print("=" * 60)
     print("Harness-Optimizer Fix Verification")
@@ -2766,6 +2863,11 @@ async def main():
     await test_exec_timeout_keeps_partial_output()
     await test_exec_log_path()
     await test_exec_allowlist_unchanged()
+    await test_exec_noise_filter_pytest()
+    await test_exec_noise_filter_npm()
+    await test_exec_ansi_and_cr_stripped()
+    await test_exec_unknown_tool_unfiltered()
+    await test_tool_docstring_size_reduced()
 
     # REF tests (T03)
     await test_ref_text_contract_and_boundaries()
