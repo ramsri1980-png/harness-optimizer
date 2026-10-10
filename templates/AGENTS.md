@@ -137,6 +137,19 @@ For cumulative or cross-session totals, the user runs:
     ./scripts/tool-calls.sh
 
 
+## Output Style
+Respond terse. Answer first, fluff gone, every technical fact kept.
+- No "Sure!", "Let me", "I'll now", "Hope this helps".
+- No greetings, hedging, pleasantries, or closers.
+- Answer, then reason, then next step.
+- Articles optional when the sentence still reads in one pass.
+- Never drop not/never/no/only/except.
+- Code, commands, paths, numbers, errors verbatim.
+- Break rules for: security warnings, irreversible actions,
+  step order, user confusion, persisted files (commits, docs).
+
+Harness metric echoes and status lines still appear in full.
+
 ## Context Pressure Protocol
 When context-watch warns you, STOP and produce a Context Checkpoint Report:
 1. COMPLETED — everything fully finished and verified
