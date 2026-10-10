@@ -6,6 +6,38 @@ const CONFIG_DIR = join(homedir(), ".config", "opencode")
 const TOTALS_PATH = join(CONFIG_DIR, ".harness-token-totals.json")
 const LOG_PATH = join(CONFIG_DIR, ".harness-token-metrics.log")
 
+function extractToolText(event: any): string {
+  const parts: string[] = []
+  const push = (v: any) => { if (typeof v === "string" && v) parts.push(v) }
+
+  // Path 1 — event.result.output as a raw string
+  const output = event?.result?.output
+  if (typeof output === "string") push(output)
+
+  // Path 2 — output as an object with any of several string fields
+  if (output && typeof output === "object") {
+    push(output.result)
+    push(output.text)
+    push(output.content)
+    push(output.value)
+    push(output.message)
+  }
+
+  // Path 3 — event.result.content as an array of {type,text} parts
+  const content = event?.result?.content
+  if (Array.isArray(content)) {
+    for (const p of content) {
+      if (p && typeof p.text === "string") push(p.text)
+      else if (typeof p === "string") push(p)
+    }
+  }
+
+  // Path 4 — event.result as a raw string (unlikely, harmless)
+  if (typeof event?.result === "string") push(event.result)
+
+  return parts.join("\n")
+}
+
 function loadTotals() {
   try {
     if (existsSync(TOTALS_PATH)) {
@@ -40,8 +72,7 @@ export default {
       if (callId && seen.has(callId)) return
       if (callId) seen.add(callId)
 
-      const direct = event?.result?.output?.result
-      const text = typeof direct === "string" ? direct : ""
+      const text = extractToolText(event)
       if (!text.includes("[TOKEN METRIC]")) return
 
       const match = text.match(
