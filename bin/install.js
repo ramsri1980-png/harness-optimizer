@@ -172,6 +172,7 @@ if (FLAGS.uninstall) {
   // Other harness-owned files (not tracked by the manifest).
   for (const f of [
     path.join(PLUGINS_DIR, "harness.ts"),
+    path.join(PLUGINS_DIR, "token-metrics-helpers.mjs"),
     path.join(CONFIG_DIR, "opencode-fallback.jsonc"),
     path.join(CONFIG_DIR, "opencode-context-watch.json"),
     METRICS_FILE,
@@ -329,6 +330,8 @@ asyncio.run(main())
   }
   check("harness.ts plugin",
     fs.existsSync(path.join(PLUGINS_DIR, "harness.ts")));
+  check("token-metrics-helpers.mjs",
+    fs.existsSync(path.join(PLUGINS_DIR, "token-metrics-helpers.mjs")));
 
   // Auto-context (CTX) checks — only meaningful when the doctor run was
   // invoked with the same --with-context flag used to install it, so a
@@ -591,6 +594,12 @@ fs.copyFileSync(
   path.join(PLUGINS_DIR, "harness.ts")
 );
 info("Installed harness.ts");
+
+fs.copyFileSync(
+  path.join(__dirname, "..", "templates", "token-metrics-helpers.mjs"),
+  path.join(PLUGINS_DIR, "token-metrics-helpers.mjs")
+);
+info("Installed token-metrics-helpers.mjs");
 
 if (!fs.existsSync(METRICS_FILE)) {
   fs.writeFileSync(METRICS_FILE, JSON.stringify({ totalSaved: 0, calls: 0 }) + "\n");

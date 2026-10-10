@@ -69,7 +69,7 @@ def estimate_tokens(text: str) -> int:
 async def emit_metric(ctx: Context, tool: str, saved: int, baseline: int, actual: int) -> str:
     line = (
         f"[TOKEN METRIC] tool={tool} saved={saved:,} "
-        f"baseline={baseline:,} actual={actual:,} type=payload_reduction"
+        f"baseline={baseline:,} actual={actual:,} type=payload_reduction kind=estimate"
     )
     await ctx.info(line)
     return line

@@ -1,6 +1,14 @@
-import { readFileSync, writeFileSync, existsSync, appendFileSync } from "fs"
+import { readFileSync, writeFileSync, renameSync, existsSync, appendFileSync } from "fs"
 import { join } from "path"
 import { homedir } from "os"
+import {
+  parseMetric,
+  isHarnessTool,
+  classifyTotals,
+  rebuildFromLog,
+  formatTotals,
+  extractLogLine,
+} from "./token-metrics-helpers.mjs"
 
 const CONFIG_DIR = join(homedir(), ".config", "opencode")
 const TOTALS_PATH = join(CONFIG_DIR, ".harness-token-totals.json")
@@ -41,15 +49,18 @@ function extractToolText(event: any): string {
 function loadTotals() {
   try {
     if (existsSync(TOTALS_PATH)) {
-      const raw = JSON.parse(readFileSync(TOTALS_PATH, "utf8"))
-      return { totalSaved: Number(raw.totalSaved) || 0, calls: Number(raw.calls) || 0 }
+      return JSON.parse(readFileSync(TOTALS_PATH, "utf8"))
     }
   } catch {}
-  return { totalSaved: 0, calls: 0 }
+  return null
 }
 
-function saveTotals(state: { totalSaved: number; calls: number }) {
-  try { writeFileSync(TOTALS_PATH, JSON.stringify(state, null, 2) + "\n") } catch {}
+function saveTotals(state: any) {
+  try {
+    const tmp = `${TOTALS_PATH}.tmp.${process.pid}.${Date.now()}`
+    writeFileSync(tmp, JSON.stringify(state, null, 2) + "\n")
+    renameSync(tmp, TOTALS_PATH)
+  } catch {}
 }
 
 function log(line: string) {
@@ -61,11 +72,30 @@ const seen = new Set<string>()
 export default {
   id: "harness.token-metrics",
   async setup(ctx: any) {
-    log("plugin loaded")
+    let existing = loadTotals()
+    let logText = ""
+    try {
+      if (existsSync(LOG_PATH)) {
+        logText = readFileSync(LOG_PATH, "utf8")
+      }
+    } catch {}
+
+    const totals = rebuildFromLog(logText)
+    if (existing && !existing.schema) {
+      totals.legacy_v1 = {
+        totalSaved: Number(existing.totalSaved) || 0,
+        calls: Number(existing.calls) || 0,
+      }
+    } else if (existing && existing.legacy_v1) {
+      totals.legacy_v1 = existing.legacy_v1
+    }
+
+    saveTotals(totals)
+    log(`plugin loaded; totals rebuilt from log: ${formatTotals(totals)}`)
 
     await ctx.tool.hook("execute.after", async (event: any) => {
       const tool = String(event?.tool ?? "")
-      if (!tool.startsWith("harness-tools_")) return
+      if (!isHarnessTool(tool)) return
       if (event?.status !== "completed") return
 
       const callId = String(event?.id ?? "")
@@ -75,24 +105,26 @@ export default {
       const text = extractToolText(event)
       if (!text.includes("[TOKEN METRIC]")) return
 
-      const match = text.match(
-        /\[TOKEN METRIC\] tool=(\S+) saved=([\d,]+) baseline=([\d,]+) actual=([\d,]+)/
-      )
-      if (!match) return
+      const metric = parseMetric(text)
+      if (!metric || metric.saved <= 0) return
 
-      const [, toolName, savedStr, baselineStr, actualStr] = match
-      const saved = parseInt(savedStr.replace(/,/g, ""), 10)
-      const baseline = parseInt(baselineStr.replace(/,/g, ""), 10)
-      const actual = parseInt(actualStr.replace(/,/g, ""), 10)
-      if (!Number.isFinite(saved)) return
+      const prev = loadTotals()
+      const updatedTotals = classifyTotals(prev, {
+        id: callId,
+        saved: metric.saved,
+        kind: metric.kind,
+      })
+      saveTotals(updatedTotals)
 
-      const totals = loadTotals()
-      totals.totalSaved += saved
-      totals.calls += 1
-      saveTotals(totals)
-
-      log(`tool=${toolName} saved=${saved} baseline=${baseline} actual=${actual} | total: ${totals.calls} calls, ${totals.totalSaved} saved`)
-
+      const ts = new Date().toISOString()
+      const runTotal = {
+        calls: updatedTotals.estimate?.calls || 0,
+        totalSaved: updatedTotals.estimate?.totalSaved || 0,
+      }
+      const logLine = extractLogLine(text, ts, runTotal)
+      try {
+        appendFileSync(LOG_PATH, `${logLine}\n`)
+      } catch {}
     })
   },
 }

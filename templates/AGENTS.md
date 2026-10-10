@@ -115,13 +115,26 @@ group), in this order:
 
 
 ## Token Metric Reporting
-Do NOT echo individual `[TOKEN METRIC]` lines during a task. They are
-recorded automatically by the token-metrics plugin.
+Do NOT echo individual `[TOKEN METRIC]` lines during a task.
 
-At the END of a task, or whenever the user asks for a summary, run:
+When your response to a user prompt is complete (all tool calls
+done, final message written), if any harness tool fired this turn
+AND the combined saved value from all `[TOKEN METRIC]` lines this
+turn is >= 1000 tokens, append exactly one line as the very last
+line of your response:
+
+    💰 saved <N> tokens this turn
+
+Where <N> is the sum of `saved=` across this turn's metric lines.
+
+Suppress this line when:
+- No harness tool fired this turn, or
+- The combined turn savings is < 1000 tokens
+
+Never echo individual metric lines mid-task.
+
+For cumulative or cross-session totals, the user runs:
     ./scripts/tool-calls.sh
-and paste the result once (it shows 💰 total saved). Do not run it
-mid-task unless asked.
 
 
 ## Context Pressure Protocol
