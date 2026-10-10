@@ -18,7 +18,7 @@
 //   - Fails open: any error leaves the request unmodified.
 
 import { createHash } from "crypto"
-import { readFileSync, realpathSync } from "fs"
+import { readFileSync, realpathSync, statSync } from "fs"
 import { isAbsolute, relative, resolve, sep } from "path"
 
 const MAX_BYTES = 8192
@@ -82,12 +82,74 @@ function lastUserText(messages: any[]): { index: number; text: string } | null {
   return null
 }
 
+/** Upper bound on remembered file fingerprints (insertion-order LRU). */
+const READ_CACHE_MAX = 32
+const fingerprintCache = new Map<string, { sha256: string; size: number; mtimeMs: number }>()
+
 /**
- * Canonicalizes `relPath` inside `root` and reads the raw bytes.
- * Returns null when the path escapes the root, is sensitive, or is unreadable.
- * This is the single code path used by both buildPacket and decideGate (Q3).
+ * Bounded, insertion-order-LRU memo of a file's fingerprint.
+ * A hit whose size and mtimeMs still match returns without reading the file,
+ * so repeated hook firings inside one session never re-hash an unchanged file.
+ * Fail open: any error returns null and the caller treats that as a miss.
  */
-function readFileInRoot(root: string, relPath: string): { rel: string; buffer: any } | null {
+function cachedFingerprint(absPath: string): { sha256: string; size: number; mtimeMs: number } | null {
+  let stat: { size: number; mtimeMs: number }
+  try {
+    const info = statSync(absPath)
+    stat = { size: info.size, mtimeMs: info.mtimeMs }
+  } catch {
+    return null
+  }
+
+  const hit = fingerprintCache.get(absPath)
+  if (hit && hit.size === stat.size && hit.mtimeMs === stat.mtimeMs) {
+    // Insertion-order LRU: re-insert to bump the entry to most-recent.
+    fingerprintCache.delete(absPath)
+    fingerprintCache.set(absPath, hit)
+    return hit
+  }
+
+  let entry: { sha256: string; size: number; mtimeMs: number } | null
+  try {
+    const buffer = readFileSync(absPath)
+    const digest = sha256Of(buffer)
+    if (!digest) return null
+    // Key on the bytes actually hashed: if the file changed between the
+    // statSync above and this read, the size mismatch forces a future miss.
+    entry = { sha256: digest, size: buffer.length, mtimeMs: stat.mtimeMs }
+  } catch {
+    return null
+  }
+
+  fingerprintCache.delete(absPath)
+  fingerprintCache.set(absPath, entry)
+  while (fingerprintCache.size > READ_CACHE_MAX) {
+    const oldest = fingerprintCache.keys().next()
+    if (oldest.done) break
+    fingerprintCache.delete(oldest.value)
+  }
+  return entry
+}
+
+/** One direct read + hash, used when the cache layer could not help (fail open). */
+function directDigest(absPath: string): string | null {
+  try {
+    return sha256Of(readFileSync(absPath))
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Canonicalizes `relPath` inside `root` and fingerprints the file.
+ * Returns null when the path escapes the root, is sensitive, or is unreadable.
+ * This is the single authorization code path shared by buildPacket and
+ * decideGate (Q3); decideGate only needs the digest for REUSE comparison.
+ */
+function fingerprintInRoot(
+  root: string,
+  relPath: string,
+): { rel: string; absPath: string; sha256: string } | null {
   let realRoot: string
   try {
     realRoot = realpathSync(root)
@@ -108,15 +170,32 @@ function readFileInRoot(root: string, relPath: string): { rel: string; buffer: a
   if (!rel || rel.startsWith("..") || isAbsolute(rel)) return null
   if (isSensitive(rel)) return null
 
+  const cached = cachedFingerprint(resolved)
+  if (cached) return { rel, absPath: resolved, sha256: cached.sha256 }
+
+  const digest = directDigest(resolved)
+  if (!digest) return null
+  return { rel, absPath: resolved, sha256: digest }
+}
+
+/**
+ * Fingerprint plus raw bytes of the file. The packet's sha256 line reuses the
+ * fingerprint computed by `fingerprintInRoot`, so the content is never hashed
+ * a second time and the REUSE digest always matches the injected packet.
+ */
+function readFileInRoot(root: string, relPath: string): { rel: string; buffer: any; sha256: string } | null {
+  const fingerprint = fingerprintInRoot(root, relPath)
+  if (!fingerprint) return null
+
   let buffer: any
   try {
-    buffer = readFileSync(resolved)
+    buffer = readFileSync(fingerprint.absPath)
   } catch {
     return null
   }
   if (!buffer || typeof buffer.length !== "number") return null
 
-  return { rel, buffer }
+  return { rel: fingerprint.rel, buffer, sha256: fingerprint.sha256 }
 }
 
 /** Full lowercase hex sha256 of the raw buffer, or null on failure (fail open). */
@@ -137,9 +216,7 @@ function buildPacket(root: string, relPath: string): string | null {
   const read = readFileInRoot(root, relPath)
   if (!read) return null
 
-  const digest = sha256Of(read.buffer)
-  if (!digest) return null
-
+  const digest = read.sha256
   const truncated = read.buffer.length > MAX_BYTES
   const body = truncated
     ? read.buffer.subarray(0, MAX_BYTES).toString("utf8")
@@ -215,14 +292,13 @@ export function decideGate(event: any, root?: string): {
   }
 
   const workspaceRoot = root || process.cwd()
-  const read = readFileInRoot(workspaceRoot, token)
-  if (!read) return { decision: "FOCUSED", token, reason: "packet-missing-or-stale" }
-  const digest = sha256Of(read.buffer)
-  if (!digest) return { decision: "FOCUSED", token, reason: "packet-missing-or-stale" }
+  // Only the fingerprint is needed here; the gate never reads file content.
+  const fingerprint = fingerprintInRoot(workspaceRoot, token)
+  if (!fingerprint) return { decision: "FOCUSED", token, reason: "packet-missing-or-stale" }
 
-  const rel = read.rel.split(sep).join("/")
+  const rel = fingerprint.rel.split(sep).join("/")
   for (const packet of existingPacketDigests(messages)) {
-    if (packet.source === rel && packet.sha256 === digest) {
+    if (packet.source === rel && packet.sha256 === fingerprint.sha256) {
       return { decision: "REUSE", token, reason: "fresh-packet-present" }
     }
   }

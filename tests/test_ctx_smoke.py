@@ -30,6 +30,7 @@ import time
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PLUGIN = os.path.join(REPO_ROOT, "templates", "auto-context.ts")
 FIXTURE_SRC = os.path.join(REPO_ROOT, "tests", "ctx_fixtures", "hello.txt")
+LIB_FIXTURE_SRC = os.path.join(REPO_ROOT, "tests", "ctx_fixtures", "lib", "util.py")
 
 STUB_PATH = "/tmp/opencode/ctx_spike/stub_provider.py"
 STUB_OUT = "/tmp/opencode/ctx_spike/request.jsonl"
@@ -39,8 +40,11 @@ MARKER = "[HARNESS REPOSITORY CONTEXT — reference data]"
 FIXTURE_SNIPPET = "Hello from the CTX fixture."
 PROMPT = "Please look at ctx_fixtures/hello.txt and tell me what it says."
 GEN_PROMPT = "hi, how are you today?"
+MISSING_PROMPT = "Please look at ctx_fixtures/nonexistent.py and tell me what it says."
+LIB_PROMPT = "Please look at ctx_fixtures/lib/util.py and tell me what it says."
 EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 SHA_LINE_RE = re.compile(r"^# sha256: ([0-9a-f]{64})$", re.MULTILINE)
+SOURCE_LINE_RE = re.compile(r"^# source: (.+)$", re.MULTILINE)
 
 BOOT_TIMEOUT = 30
 RUN_TIMEOUT = 180
@@ -312,11 +316,123 @@ def _check_api03(env, workspace):
     )
 
 
+def _run_prompt(env, workspace, prompt, label):
+    """One isolated opencode run turn; returns what the stub captured for it."""
+    offset = os.path.getsize(STUB_OUT) if os.path.isfile(STUB_OUT) else 0
+    proc = subprocess.run(
+        ["opencode", "run", "--standalone", "--auto", "-m", "stub/stub-1", prompt],
+        cwd=workspace,
+        env=env,
+        capture_output=True,
+        timeout=RUN_TIMEOUT,
+    )
+    print("[opencode] %s run exit=%s" % (label, proc.returncode))
+
+    bodies, raw = _read_appended(offset)
+    print("[stub] captured %d request body/bodies from the %s run" % (len(bodies), label))
+    return bodies, raw
+
+
+def _body_text(body):
+    """Every text part of a captured body, decoded (no JSON escaping)."""
+    if not isinstance(body, dict):
+        return ""
+    texts = []
+    for message in body.get("messages", []):
+        if not isinstance(message, dict):
+            continue
+        texts.extend(_message_texts(message))
+    return "\n".join(texts)
+
+
+def _primary_packet(primary):
+    """(source, sha256) of the first harness packet in a captured body."""
+    text = _body_text(primary)
+    if MARKER not in text:
+        return None, None
+    source = SOURCE_LINE_RE.search(text)
+    digest = SHA_LINE_RE.search(text)
+    return (
+        source.group(1).strip() if source else None,
+        digest.group(1) if digest else None,
+    )
+
+
+def _packet_count(primary):
+    """Number of harness-owned packet messages in a captured body."""
+    if not isinstance(primary, dict):
+        return 0
+    return sum(
+        1
+        for message in primary.get("messages", [])
+        if isinstance(message, dict)
+        and any(MARKER in text for text in _message_texts(message))
+    )
+
+
+def _check_api06(env, workspace, first_source, first_digest):
+    """Second turn naming the SAME unchanged file: reuse, never duplicate."""
+    bodies, _raw = _run_prompt(env, workspace, PROMPT, "second-mention")
+    primary = _primary_body(bodies)
+    packets = _packet_count(primary)
+    source, digest = _primary_packet(primary)
+    ok = (
+        primary is not None
+        and packets == 1
+        and source is not None
+        and source == first_source
+        and digest is not None
+        and digest == first_digest
+    )
+    return _check(
+        "CTX-API-06: second mention reuses the packet "
+        "(exactly one, same source, same sha256)",
+        ok,
+        "packets=%d source=%s sha256=%s (first run: source=%s sha256=%s)"
+        % (packets, source, digest, first_source, first_digest),
+    )
+
+
+def _check_api08(env, workspace):
+    """Fail open: a missing file must neither block nor inject."""
+    bodies, raw = _run_prompt(env, workspace, MISSING_PROMPT, "missing-file")
+    primary = _primary_body(bodies)
+    packets = _packet_count(primary)
+    marker_in_raw = MARKER in raw.decode("utf-8", "replace")
+    ok = len(bodies) > 0 and primary is not None and packets == 0 and not marker_in_raw
+    return _check(
+        "CTX-API-08: missing file produces no packet and no failure",
+        ok,
+        "captured=%d packets=%d marker=%s" % (len(bodies), packets, marker_in_raw),
+    )
+
+
+def _check_api09(env, workspace):
+    """Nested path support: ctx_fixtures/lib/util.py is injected, digest + body."""
+    bodies, _raw = _run_prompt(env, workspace, LIB_PROMPT, "lib-fixture")
+    primary = _primary_body(bodies)
+    text = _body_text(primary)
+    digest = SHA_LINE_RE.search(text)
+    ok = (
+        primary is not None
+        and MARKER in text
+        and "# source: ctx_fixtures/lib/util.py" in text
+        and digest is not None
+        and "def helper" in text
+    )
+    return _check(
+        "CTX-API-09: nested lib fixture is injected with a sha256 fingerprint",
+        ok,
+        "marker=%s sha256=%s content=%s"
+        % (MARKER in text, digest.group(1) if digest else "<missing>", "def helper" in text),
+    )
+
 def main():
     for label, path in (
         ("stub provider", STUB_PATH),
         ("plugin", PLUGIN),
         ("fixture", FIXTURE_SRC),
+        ("lib fixture", LIB_FIXTURE_SRC),
     ):
         if not os.path.isfile(path):
             if label == "stub provider":
@@ -360,6 +476,10 @@ def main():
         os.makedirs(os.path.join(workspace, "ctx_fixtures"))
         shutil.copyfile(
             FIXTURE_SRC, os.path.join(workspace, "ctx_fixtures", "hello.txt")
+        )
+        os.makedirs(os.path.join(workspace, "ctx_fixtures", "lib"))
+        shutil.copyfile(
+            LIB_FIXTURE_SRC, os.path.join(workspace, "ctx_fixtures", "lib", "util.py")
         )
 
         # OpenCode v2.0.24 rejects a bare file in `plugins`
@@ -419,8 +539,30 @@ def main():
 
         # CTX Day 2 checks, reusing the same stub and the same captured run.
         ok &= _check_api01(bodies)
+
+        # CTX-API-02 makes the zero-tool-call claim explicit on that same run:
+        # the stub never asks for repo data of its own, yet the packet is in
+        # the primary request the model actually sees.
+        raw_text = raw.decode("utf-8", "replace")
+        ok &= _check(
+            "CTX-API-02: zero-tool-call model still receives the packet",
+            MARKER in raw_text
+            and "# source: ctx_fixtures/hello.txt" in raw_text,
+            "model=stub (no tool calls), packet_present=%s" % (MARKER in raw_text),
+        )
+
         ok &= _check_api05(bodies)
         ok &= _check_api03(env, workspace)
+
+        # Fingerprint of the packet the first run injected, so the REUSE run
+        # can prove it did not change the file or duplicate the packet.
+        first_source, first_digest = _primary_packet(_primary_body(bodies))
+        print("[packet] first run source=%s sha256=%s" % (first_source, first_digest))
+
+        # CTX Day 3+4 checks: isolated second/third/fourth turns.
+        ok &= _check_api06(env, workspace, first_source, first_digest)
+        ok &= _check_api08(env, workspace)
+        ok &= _check_api09(env, workspace)
 
         print("\n%d/%d checks passed" % (sum(1 for _, c in check_results if c), len(check_results)))
         return 0 if ok else 1
