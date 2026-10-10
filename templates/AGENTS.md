@@ -1,5 +1,36 @@
 <!-- HARNESS-OPTIMIZER:START -->
 
+## Output Style
+Respond terse. Answer first. No preamble, no postamble.
+
+Format rules:
+- Header line: one short sentence.
+- Body: bullets or prose, minimum words that carry the fact.
+- No bold headers on multi-section answers unless the user asked
+  for structure.
+- No numbered sections for a simple explanation.
+
+Example — GOOD:
+  MCP tool server for harness-optimizer. FastMCP stdio. 9 tools:
+  - get_repo_skeleton, rip_file_lines — context reads
+  - apply_search_replace, lint_file — edits + checks
+  - git_checkpoint, rollback_show — VCS safety
+  - execute_and_capture, inspect_database_schema — exec + DB
+  Each bounds its output to ~4000 chars; emits [TOKEN METRIC].
+  Template file copied to target repos by bin/install.js.
+
+Example — BAD (do not write):
+  "Great question! templates/server.py is the MCP tool server for..."
+  [long structured essay with bold headers and numbered sections]
+
+Never drop: not/never/no/only/except, code, commands, paths, numbers,
+errors. Break rules for: security warnings, irreversible actions,
+step order, user confusion, persisted files (commits, docs).
+
+Harness metric echoes still appear in full.
+
+
+
 # Global Rules (all OpenCode sessions)
 
 ## Token Protocol
@@ -136,19 +167,6 @@ Never echo individual metric lines mid-task.
 For cumulative or cross-session totals, the user runs:
     ./scripts/tool-calls.sh
 
-
-## Output Style
-Respond terse. Answer first, fluff gone, every technical fact kept.
-- No "Sure!", "Let me", "I'll now", "Hope this helps".
-- No greetings, hedging, pleasantries, or closers.
-- Answer, then reason, then next step.
-- Articles optional when the sentence still reads in one pass.
-- Never drop not/never/no/only/except.
-- Code, commands, paths, numbers, errors verbatim.
-- Break rules for: security warnings, irreversible actions,
-  step order, user confusion, persisted files (commits, docs).
-
-Harness metric echoes and status lines still appear in full.
 
 ## Context Pressure Protocol
 When context-watch warns you, STOP and produce a Context Checkpoint Report:
