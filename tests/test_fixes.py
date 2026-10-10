@@ -2767,6 +2767,14 @@ async def main():
     await test_exec_log_path()
     await test_exec_allowlist_unchanged()
 
+    # REF tests (T03)
+    await test_ref_text_contract_and_boundaries()
+    await test_ref_status_budget_regression()
+    await test_ref_long_first_match_and_header()
+    await test_ref_read_failure_and_long_no_match()
+    await test_ref_symbol_ambiguity_and_evidence()
+    await test_ref_directed_hops_and_self_edges()
+
     # CORE regression tests (tests/test_core.py) — counts toward the tally
     import test_core
     test_core.run()
@@ -2969,6 +2977,207 @@ async def test_lint_rejects_cross_file_and_generic_line():
             r = await server.lint_file(f)
         check("Generic 'line N' not treated as source location",
               "valid.py:1" not in r, r[:400])
+
+
+# ═══════════════════════════════════════════════════════════
+# T03 find_dependent_references (REF-01 through REF-06)
+# ═══════════════════════════════════════════════════════════
+
+async def test_ref_text_contract_and_boundaries():
+    print("\n[REF-01] find_refs text contract and boundaries")
+    from unittest.mock import patch
+
+    with tempfile.TemporaryDirectory() as d:
+        p0 = os.path.join(d, "empty.py")
+        with open(p0, "w") as f:
+            f.write("bar = False\n")
+        r0 = await server.find_dependent_references("foo", d, mode="text")
+        check("REF-01: 0 matches returns non-empty no-match message",
+              bool(r0) and ("no" in r0.lower() or "not" in r0.lower()),
+              r0[:200])
+
+        p1 = os.path.join(d, "one.py")
+        with open(p1, "w") as f:
+            f.write("foo = True\n")
+        os.remove(p0)
+        r1 = await server.find_dependent_references("foo", d, mode="text")
+        lines1 = [l for l in r1.splitlines() if "one.py:" in l]
+        check("REF-01: 1 match returns exactly 1 location line", len(lines1) == 1, r1[:200])
+
+        with open(p1, "w") as f:
+            f.write("foo = True\n" * 40)
+        r40 = await server.find_dependent_references("foo", d, mode="text")
+        lines40 = [l for l in r40.splitlines() if "one.py:" in l]
+        check("REF-01: 40 matches all 40 shown", len(lines40) == 40, f"found {len(lines40)}")
+
+        with open(p1, "w") as f:
+            f.write("foo = True\n" * 41)
+        r41 = await server.find_dependent_references("foo", d, mode="text")
+        lines41 = [l for l in r41.splitlines() if "one.py:" in l]
+        check("REF-01: 41 matches shows 40 with count limit or omission",
+              len(lines41) == 40 and ("count limit" in r41.lower() or "omitted" in r41.lower()),
+              r41[-200:])
+
+        rempty = await server.find_dependent_references("", d, mode="text")
+        check("REF-01: empty target_symbol returns error or no-match without crashing",
+              isinstance(rempty, str) and (rempty.startswith("ERROR:") or "no" in rempty.lower()),
+              rempty[:100])
+
+        for inv in (0, -1, "abc"):
+            rinv = await server.find_dependent_references("foo", d, mode="text", max_results=inv)
+            check(f"REF-01: invalid max_results={inv!r} handled safely without crash",
+                  isinstance(rinv, str) and (rinv.startswith("ERROR:") or "foo" in rinv),
+                  str(rinv)[:100])
+
+        with patch("ast.parse", side_effect=AssertionError("ast.parse called in text mode")):
+            r_no_ast = await server.find_dependent_references("foo", d, mode="text")
+            check("REF-01: text mode never invokes ast.parse", "foo" in r_no_ast)
+
+
+async def test_ref_status_budget_regression():
+    print("\n[REF-02] find_refs status budget regression")
+    import re
+    with tempfile.TemporaryDirectory() as d:
+        fname = os.path.join(d, "watchlist_duplicate_normalization_checks.py")
+        with open(fname, "w") as f:
+            f.write("foo = True\nfoo = True\nfoo = True\n")
+
+        r = await server.find_dependent_references("foo", d, max_results=2, max_chars=256)
+        check("REF-02: full output length <= 256 characters", len(r) <= 256, f"len={len(r)}")
+
+        first_line = r.splitlines()[0]
+        m = re.search(r"\((\d+)\s+match", first_line)
+        header_count = int(m.group(1)) if m else -1
+        loc_lines = [l for l in r.splitlines()[1:] if l and not l.startswith("#")]
+        check("REF-02: displayed count equals location lines shown",
+              header_count == len(loc_lines),
+              f"header={header_count}, locs={len(loc_lines)}")
+
+        has_loc = any("watchlist_duplicate_normalization_checks.py:" in l for l in loc_lines)
+        check("REF-02: at least one location survives cap", has_loc, r[:200])
+
+        has_warning = "limit" in r.lower() or "count limit" in r.lower() or "omitted" in r.lower()
+        check("REF-02: count warning survives cap", has_warning, r[-100:])
+
+
+async def test_ref_long_first_match_and_header():
+    print("\n[REF-03] find_refs long first match and header")
+    with tempfile.TemporaryDirectory() as d:
+        fa = os.path.join(d, "long_first.py")
+        with open(fa, "w") as f:
+            f.write('TARGET = "' + "x" * 15000 + '"\n')
+            f.write("TARGET = short\n")
+
+        ra = await server.find_dependent_references("TARGET", d, max_chars=300)
+        check("REF-03: (a) response length <= 300", len(ra) <= 300, f"len={len(ra)}")
+        check("REF-03: (a) at least one location shown",
+              "long_first.py:1" in ra or "long_first.py:2" in ra, ra[:250])
+        check("REF-03: (a) header is present",
+              "# find_dependent_references:" in ra, ra[:150])
+        check("REF-03: (a) does not silently claim complete coverage",
+              "limit" in ra.lower() or "omitted" in ra.lower() or "..." in ra or "hard-clipped" in ra.lower(),
+              ra[-150:])
+
+    with tempfile.TemporaryDirectory() as d2:
+        fb = os.path.join(d2, "forty_matches.py")
+        with open(fb, "w") as f:
+            for i in range(40):
+                f.write(f'TARGET_{i:02d} = "' + "y" * 180 + '"\n')
+
+        rb = await server.find_dependent_references("TARGET", d2, max_chars=8000)
+        loc_count = sum(1 for l in rb.splitlines() if "forty_matches.py:" in l)
+        check("REF-03: (b) response bounded <= 8000", len(rb) <= 8000, f"len={len(rb)}")
+        check("REF-03: (b) many matches survive truncation (> 20)",
+              loc_count > 20, f"survived={loc_count}")
+
+
+async def test_ref_read_failure_and_long_no_match():
+    print("\n[REF-04] find_refs read failure and long no-match")
+    from unittest.mock import patch
+
+    with tempfile.TemporaryDirectory() as d:
+        p_ok = os.path.join(d, "good.py")
+        with open(p_ok, "w") as f:
+            f.write("def normal(): pass\n")
+        p_locked = os.path.join(d, "locked.py")
+        with open(p_locked, "w") as f:
+            f.write("def secret(): pass\n")
+
+        real_open = open
+        def mock_open(path, *args, **kwargs):
+            if str(path).endswith("locked.py"):
+                raise PermissionError("Permission denied: locked.py")
+            return real_open(path, *args, **kwargs)
+
+        with patch("builtins.open", side_effect=mock_open):
+            r_sym = await server.find_dependent_references("target", d, mode="symbols")
+
+        check("REF-04: symbols mode marks response as incomplete on read failure",
+              "incomplete" in r_sym.lower() or "skipped:" in r_sym.lower() or "warning:" in r_sym.lower(),
+              r_sym[:300])
+        check("REF-04: symbols mode mentions skipped file name or count",
+              "locked.py" in r_sym or "1 file" in r_sym,
+              r_sym[:300])
+
+        huge = "Z" * 9000
+        r_text = await server.find_dependent_references(huge, d, mode="text", max_chars=8000)
+        check("REF-04: 9000-char search string output bounded <= 8000", len(r_text) <= 8000, f"len={len(r_text)}")
+        check("REF-04: 9000-char search string produces no-match message",
+              "no text matches" in r_text.lower(), r_text[:200])
+
+
+async def test_ref_symbol_ambiguity_and_evidence():
+    print("\n[REF-05] find_refs symbol ambiguity and evidence")
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "class_a.py"), "w") as f:
+            f.write("class A:\n    def save(self):\n        pass\n")
+        with open(os.path.join(d, "class_b.py"), "w") as f:
+            f.write("class B:\n    def save(self):\n        pass\n")
+        with open(os.path.join(d, "caller.py"), "w") as f:
+            f.write("import class_a, class_b\na = class_a.A()\na.save()\ntext = \"save the file\"\n")
+
+        r = await server.find_dependent_references("save", d, mode="symbols")
+
+        check("REF-05: A.save appears as definition", "A.save" in r, r)
+        check("REF-05: B.save appears as definition", "B.save" in r, r)
+        check("REF-05: Call in caller.py appears as reference",
+              "caller.py" in r and "in <module>" in r, r)
+        check("REF-05: String literal not counted as reference",
+              "save the file" not in r and "caller.py:L4" not in r, r)
+        check("REF-05: Total references shown is 1",
+              "1 reference" in r or "1 references" in r, r)
+
+
+async def test_ref_directed_hops_and_self_edges():
+    print("\n[REF-06] find_refs directed hops and self edges")
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "a.py"), "w") as f:
+            f.write("def alpha():\n    return beta()\n")
+        with open(os.path.join(d, "b.py"), "w") as f:
+            f.write("def beta():\n    return gamma()\n")
+        with open(os.path.join(d, "c.py"), "w") as f:
+            f.write("def gamma():\n    return 1\n")
+        with open(os.path.join(d, "d.py"), "w") as f:
+            f.write("def delta():\n    return 99\n")
+
+        # depth=1
+        r1 = await server.find_dependent_references("alpha", d, mode="related", depth=1)
+        check("REF-06: depth=1 beta at hop 1", "beta" in r1 and "[hop=1]" in r1, r1)
+        check("REF-06: depth=1 gamma and delta absent",
+              "gamma" not in r1 and "delta" not in r1, r1)
+
+        # depth=2
+        r2 = await server.find_dependent_references("alpha", d, mode="related", depth=2)
+        check("REF-06: depth=2 beta at hop 1", "beta" in r2 and "[hop=1]" in r2, r2)
+        check("REF-06: depth=2 gamma at hop 2", "gamma" in r2 and "[hop=2]" in r2, r2)
+        check("REF-06: depth=2 delta absent", "delta" not in r2, r2)
+
+        # Self-referencing file does not create self-loop inflating hop count
+        with open(os.path.join(d, "loop.py"), "w") as f:
+            f.write("def self_loop():\n    return self_loop()\n")
+        r_loop = await server.find_dependent_references("self_loop", d, mode="related", depth=3)
+        check("REF-06: self-reference does not inflate hop count",
+              "[hop=" not in r_loop and "(max hop reached: 0)" in r_loop, r_loop)
 
 
 if __name__ == "__main__":

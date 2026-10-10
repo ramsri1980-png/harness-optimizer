@@ -468,17 +468,38 @@ async def find_dependent_references(
     repo_path: str,
     max_results: int = 40,
     max_chars: int = 8000,
+    mode: str = "text",
+    symbol_file: str = "",
+    depth: int = 2,
 ) -> str:
-    """Bounded text search for a symbol in Python files.
+    """Bounded search for a symbol in Python files.
 
     Substring search, NOT semantic dependency analysis. Matches any
     line containing the symbol text, including comments and strings.
     Use as a hint, not a verdict.
+
+    Modes:
+      text    (default) — Substring search across lines.
+      symbols — Python AST-indexed definitions and references.
+      related — Bounded directed neighborhood from a seed definition.
     """
+    if mode not in {"text", "symbols", "related"}:
+        return f"ERROR: unsupported mode '{mode}' \u2014 use 'text', 'symbols', or 'related'"
+
     if not target_symbol or not target_symbol.strip():
         return "ERROR: target_symbol must be non-empty and not whitespace-only."
+    if not isinstance(max_results, int) or isinstance(max_results, bool):
+        try:
+            max_results = int(max_results)
+        except (TypeError, ValueError):
+            max_results = 40
     if max_results < 1:
         return "ERROR: max_results must be >= 1."
+    if not isinstance(max_chars, int) or isinstance(max_chars, bool):
+        try:
+            max_chars = int(max_chars)
+        except (TypeError, ValueError):
+            max_chars = 8000
     if max_chars < 256:
         return "ERROR: max_chars must be >= 256."
 
@@ -486,166 +507,505 @@ async def find_dependent_references(
     if not os.path.isdir(root_path):
         return f"ERROR: Not a directory: {root_path}"
 
-    SKIP_DIRS = {"venv", ".venv", "env", ".git", "__pycache__",
-                 "node_modules", "dist", "build", ".tox", ".mypy_cache",
-                 ".pytest_cache", "site-packages"}
+    if mode == "text":
+        SKIP_DIRS = {"venv", ".venv", "env", ".git", "__pycache__",
+                     "node_modules", "dist", "build", ".tox", ".mypy_cache",
+                     ".pytest_cache", "site-packages"}
 
-    SYMBOL_DISPLAY_MAX = 80
-    PER_LINE_MAX = 200
-    HARD_CLIP_SUFFIX = "\n# ... hard-clipped to max_chars"
+        SYMBOL_DISPLAY_MAX = 80
+        PER_LINE_MAX = 200
+        HARD_CLIP_SUFFIX = "\n# ... hard-clipped to max_chars"
 
-    # ── collect matches ──
-    matches: list[str] = []
-    overflow_by_count = False
-    unreadable_count = 0
-    cap = max_results + 1
+        # ── collect matches ──
+        matches: list[str] = []
+        overflow_by_count = False
+        unreadable_count = 0
+        cap = max_results + 1
 
-    for dirpath, dirnames, filenames in os.walk(root_path):
-        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
-        for file in sorted(filenames):
-            if not file.endswith(".py"):
-                continue
-            if len(matches) >= cap:
-                overflow_by_count = True
-                break
-            f_path = os.path.join(dirpath, file)
-            try:
-                with open(f_path, "r", encoding="utf-8", errors="ignore") as f:
-                    for idx, line in enumerate(f, 1):
-                        if target_symbol in line:
-                            rel = os.path.relpath(f_path, root_path)
-                            matches.append(f"{rel}:{idx} \u2192 {line.rstrip()}")
-                            if len(matches) >= cap:
-                                overflow_by_count = True
-                                break
-            except Exception:
-                unreadable_count += 1
-                continue
+        for dirpath, dirnames, filenames in os.walk(root_path):
+            dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+            for file in sorted(filenames):
+                if not file.endswith(".py"):
+                    continue
+                if len(matches) >= cap:
+                    overflow_by_count = True
+                    break
+                f_path = os.path.join(dirpath, file)
+                try:
+                    with open(f_path, "r", encoding="utf-8", errors="ignore") as f:
+                        for idx, line in enumerate(f, 1):
+                            if target_symbol in line:
+                                rel = os.path.relpath(f_path, root_path)
+                                matches.append(f"{rel}:{idx} \u2192 {line.rstrip()}")
+                                if len(matches) >= cap:
+                                    overflow_by_count = True
+                                    break
+                except Exception:
+                    unreadable_count += 1
+                    continue
+                if overflow_by_count:
+                    break
             if overflow_by_count:
                 break
-        if overflow_by_count:
-            break
 
-    # ── helpers ──
-    symbol_display = target_symbol
-    if len(symbol_display) > SYMBOL_DISPLAY_MAX:
-        symbol_display = symbol_display[: SYMBOL_DISPLAY_MAX - 3] + "..."
+        # ── helpers ──
+        symbol_display = target_symbol
+        if len(symbol_display) > SYMBOL_DISPLAY_MAX:
+            symbol_display = symbol_display[: SYMBOL_DISPLAY_MAX - 3] + "..."
 
-    def hard_clip(text: str) -> str:
-        if len(text) <= max_chars:
-            return text
-        if max_chars <= len(HARD_CLIP_SUFFIX):
-            return text[:max_chars]
-        return text[: max_chars - len(HARD_CLIP_SUFFIX)] + HARD_CLIP_SUFFIX
+        def hard_clip(text: str) -> str:
+            if len(text) <= max_chars:
+                return text
+            if max_chars <= len(HARD_CLIP_SUFFIX):
+                return text[:max_chars]
+            return text[: max_chars - len(HARD_CLIP_SUFFIX)] + HARD_CLIP_SUFFIX
 
-    def shorten_text(text: str, limit: int) -> str:
-        if len(text) <= limit:
-            return text
-        if limit <= 3:
-            return text[:limit]
-        return text[: limit - 3] + "..."
+        def shorten_text(text: str, limit: int) -> str:
+            if len(text) <= limit:
+                return text
+            if limit <= 3:
+                return text[:limit]
+            return text[: limit - 3] + "..."
 
-    truncated_by_count = overflow_by_count and len(matches) > max_results
-    if truncated_by_count:
-        matches = matches[:max_results]
+        truncated_by_count = overflow_by_count and len(matches) > max_results
+        if truncated_by_count:
+            matches = matches[:max_results]
 
-    base_status_bits: list[str] = []
-    if truncated_by_count:
-        base_status_bits.append(f"count limit {max_results} reached")
-    if unreadable_count > 0:
-        base_status_bits.append(
-            f"{unreadable_count} file(s) unreadable; search may be incomplete"
-        )
-
-    def build_status(extra: str = "") -> str:
-        bits = base_status_bits[:]
-        if extra:
-            bits.append(extra)
-        if not bits:
-            return ""
-        # Compact, single line; hard_clip protects total size.
-        return "\n# " + "; ".join(bits)
-
-    # ── no-match branch ──
-    if not matches:
-        out = f"No text matches for '{symbol_display}' in the searched scope."
-        out += build_status()
-        return hard_clip(out)
-
-    # ── prepare (loc, text) pairs with per-line cap ──
-    prepared: list[tuple[str, str]] = []
-    for m in matches:
-        if " \u2192 " in m:
-            loc, _, text = m.partition(" \u2192 ")
-            prepared.append((loc, shorten_text(text, PER_LINE_MAX)))
-        else:
-            prepared.append(("", m))
-
-    def make_header(n_shown: int) -> str:
-        word = "match" if n_shown == 1 else "matches"
-        return (
-            f"# find_dependent_references: '{symbol_display}' "
-            f"({n_shown} {word} shown)\n"
-            f"# Text match only \u2014 not proof of callers or semantic dependencies."
-        )
-
-    # ── fit matches greedily, keeping locations ──
-    body_lines: list[str] = []
-    skipped = 0
-
-    for i, (loc, text) in enumerate(prepared):
-        prospective = len(body_lines) + 1
-        header_len = len(make_header(prospective))
-        remaining = len(prepared) - prospective
-        extra_status = ""
-        if remaining > 0:
-            extra_status = (
-                f"char limit {max_chars} reached ({remaining} more match(es) omitted)"
+        base_status_bits: list[str] = []
+        if truncated_by_count:
+            base_status_bits.append(f"count limit {max_results} reached")
+        if unreadable_count > 0:
+            base_status_bits.append(
+                f"{unreadable_count} file(s) unreadable; search may be incomplete"
             )
-        status_len = len(build_status(extra_status))
-        budget = max_chars - header_len - status_len - 1
 
-        sep = 1 if body_lines else 0
-        used = sum(len(x) for x in body_lines) + max(0, len(body_lines) - 1)
-        available = budget - used - sep
+        def build_status(extra: str = "") -> str:
+            bits = base_status_bits[:]
+            if extra:
+                bits.append(extra)
+            if not bits:
+                return ""
+            # Compact, single line; hard_clip protects total size.
+            return "\n# " + "; ".join(bits)
 
-        if available < 12:
+        # ── no-match branch ──
+        if not matches:
+            out = f"No text matches for '{symbol_display}' in the searched scope."
+            out += build_status()
+            return hard_clip(out)
+
+        # ── prepare (loc, text) pairs with per-line cap ──
+        prepared: list[tuple[str, str]] = []
+        for m in matches:
+            if " \u2192 " in m:
+                loc, _, text = m.partition(" \u2192 ")
+                prepared.append((loc, shorten_text(text, PER_LINE_MAX)))
+            else:
+                prepared.append(("", m))
+
+        def make_header(n_shown: int) -> str:
+            word = "match" if n_shown == 1 else "matches"
+            return (
+                f"# find_dependent_references: '{symbol_display}' "
+                f"({n_shown} {word} shown)\n"
+                f"# Text match only \u2014 not proof of callers or semantic dependencies."
+            )
+
+        # ── fit matches greedily, keeping locations ──
+        body_lines: list[str] = []
+        skipped = 0
+
+        for i, (loc, text) in enumerate(prepared):
+            prospective = len(body_lines) + 1
+            header_len = len(make_header(prospective))
+            remaining = len(prepared) - prospective
+            extra_status = ""
+            if remaining > 0:
+                extra_status = (
+                    f"char limit {max_chars} reached ({remaining} more match(es) omitted)"
+                )
+            status_len = len(build_status(extra_status))
+            budget = max_chars - header_len - status_len - 1
+
+            sep = 1 if body_lines else 0
+            used = sum(len(x) for x in body_lines) + max(0, len(body_lines) - 1)
+            available = budget - used - sep
+
+            if available < 12:
+                skipped = len(prepared) - i
+                break
+
+            full = f"{loc} \u2192 {text}" if loc else text
+
+            if len(full) <= available:
+                body_lines.append(full)
+                continue
+
+            # Try shortened form that keeps the location marker
+            if loc:
+                min_form = f"{loc} \u2192 ..."
+                if len(min_form) <= available:
+                    overhead = len(loc) + len(" \u2192 ") + 3
+                    keep = available - overhead
+                    if keep > 0:
+                        body_lines.append(f"{loc} \u2192 {text[:keep]}...")
+                    else:
+                        body_lines.append(min_form)
+                    continue
+
             skipped = len(prepared) - i
             break
 
-        full = f"{loc} \u2192 {text}" if loc else text
+        # ── build final output (accurate header count) ──
+        header = make_header(len(body_lines))
+        extra = ""
+        if skipped > 0:
+            extra = f"char limit {max_chars} reached ({skipped} more match(es) omitted)"
 
-        if len(full) <= available:
-            body_lines.append(full)
-            continue
+        out = header
+        if body_lines:
+            out += "\n" + "\n".join(body_lines)
+        out += build_status(extra)
 
-        # Try shortened form that keeps the location marker
-        if loc:
-            min_form = f"{loc} \u2192 ..."
-            if len(min_form) <= available:
-                overhead = len(loc) + len(" \u2192 ") + 3
-                keep = available - overhead
-                if keep > 0:
-                    body_lines.append(f"{loc} \u2192 {text[:keep]}...")
-                else:
-                    body_lines.append(min_form)
+        return hard_clip(out)
+
+    # ── AST indexing for "symbols" and "related" ──
+    max_results = min(max_results, 200)
+    max_chars = min(max_chars, 32000)
+
+    class _SymDef:
+        __slots__ = ("relpath", "lineno", "kind", "qualified_name", "name", "node")
+
+        def __init__(self, relpath: str, lineno: int, kind: str, qualified_name: str, node: ast.AST):
+            self.relpath = relpath
+            self.lineno = lineno
+            self.kind = kind
+            self.qualified_name = qualified_name
+            self.name = qualified_name.split(".")[-1]
+            self.node = node
+
+        @property
+        def key(self) -> tuple[str, int, str]:
+            return (self.relpath, self.lineno, self.qualified_name)
+
+    class _SymRef:
+        __slots__ = ("relpath", "lineno", "enclosing_def")
+
+        def __init__(self, relpath: str, lineno: int, enclosing_def: str):
+            self.relpath = relpath
+            self.lineno = lineno
+            self.enclosing_def = enclosing_def
+
+        @property
+        def key(self) -> tuple[str, int, str]:
+            return (self.relpath, self.lineno, self.enclosing_def)
+
+    def _collect_file_symbols(tree: ast.AST, relpath: str, target: str):
+        defs: list[_SymDef] = []
+        refs: list[_SymRef] = []
+        seen_refs: set[tuple[str, int, str]] = set()
+        t_last = target.split(".")[-1] if target else ""
+
+        def visit_block(nodes: list[ast.AST], scope: list[str], enclosing: str):
+            for n in nodes:
+                visit_node(n, scope, enclosing)
+
+        def visit_node(n: ast.AST, scope: list[str], enclosing: str):
+            if isinstance(n, ast.ClassDef):
+                qname = ".".join(scope + [n.name])
+                defs.append(_SymDef(relpath, n.lineno, "class", qname, n))
+                for d in getattr(n, "decorator_list", []):
+                    visit_expr(d, enclosing)
+                for b in getattr(n, "bases", []):
+                    visit_expr(b, enclosing)
+                for kw in getattr(n, "keywords", []):
+                    visit_expr(kw.value, enclosing)
+                visit_block(n.body, scope + [n.name], qname)
+            elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                kind = "async def" if isinstance(n, ast.AsyncFunctionDef) else "def"
+                qname = ".".join(scope + [n.name])
+                defs.append(_SymDef(relpath, n.lineno, kind, qname, n))
+                for d in getattr(n, "decorator_list", []):
+                    visit_expr(d, enclosing)
+                if n.returns:
+                    visit_expr(n.returns, enclosing)
+                args = n.args
+                all_defaults = (getattr(args, "defaults", []) or []) + [
+                    df for df in (getattr(args, "kw_defaults", []) or []) if df is not None
+                ]
+                for df in all_defaults:
+                    visit_expr(df, enclosing)
+                visit_block(n.body, scope + [n.name], qname)
+            elif isinstance(n, (ast.If, ast.While)):
+                visit_expr(n.test, enclosing)
+                visit_block(n.body, scope, enclosing)
+                visit_block(n.orelse, scope, enclosing)
+            elif isinstance(n, (ast.For, ast.AsyncFor)):
+                visit_expr(n.target, enclosing)
+                visit_expr(n.iter, enclosing)
+                visit_block(n.body, scope, enclosing)
+                visit_block(n.orelse, scope, enclosing)
+            elif isinstance(n, (ast.With, ast.AsyncWith)):
+                for it in n.items:
+                    visit_expr(it.context_expr, enclosing)
+                    if it.optional_vars:
+                        visit_expr(it.optional_vars, enclosing)
+                visit_block(n.body, scope, enclosing)
+            elif isinstance(n, ast.Try):
+                visit_block(n.body, scope, enclosing)
+                for h in n.handlers:
+                    if h.type:
+                        visit_expr(h.type, enclosing)
+                    visit_block(h.body, scope, enclosing)
+                visit_block(n.orelse, scope, enclosing)
+                visit_block(n.finalbody, scope, enclosing)
+            elif hasattr(ast, "TryStar") and isinstance(n, ast.TryStar):
+                visit_block(n.body, scope, enclosing)
+                for h in n.handlers:
+                    if h.type:
+                        visit_expr(h.type, enclosing)
+                    visit_block(h.body, scope, enclosing)
+                visit_block(n.orelse, scope, enclosing)
+                visit_block(n.finalbody, scope, enclosing)
+            elif hasattr(ast, "Match") and isinstance(n, ast.Match):
+                visit_expr(n.subject, enclosing)
+                for cs in n.cases:
+                    if cs.guard:
+                        visit_expr(cs.guard, enclosing)
+                    visit_block(cs.body, scope, enclosing)
+            else:
+                for child in ast.iter_child_nodes(n):
+                    if isinstance(child, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                        visit_node(child, scope, enclosing)
+                    else:
+                        visit_expr(child, enclosing)
+
+        def visit_expr(expr: ast.AST, enclosing: str):
+            if not target:
+                return
+            for child in ast.walk(expr):
+                if isinstance(child, ast.Name):
+                    if child.id == t_last:
+                        k = (relpath, child.lineno, enclosing)
+                        if k not in seen_refs:
+                            seen_refs.add(k)
+                            refs.append(_SymRef(relpath, child.lineno, enclosing))
+                elif isinstance(child, ast.Attribute):
+                    if child.attr == t_last:
+                        k = (relpath, child.lineno, enclosing)
+                        if k not in seen_refs:
+                            seen_refs.add(k)
+                            refs.append(_SymRef(relpath, child.lineno, enclosing))
+
+        visit_block(tree.body, [], "<module>")
+        return defs, refs
+
+    SKIP_DIRS = {
+        "venv", ".venv", "env", ".git", "__pycache__",
+        "node_modules", "dist", "build", ".tox", ".mypy_cache",
+        ".pytest_cache", "site-packages",
+    }
+
+    all_defs: list[_SymDef] = []
+    all_refs: list[_SymRef] = []
+    unreadable_files: list[str] = []
+    syntax_error_files: list[str] = []
+
+    for dirpath, dirnames, filenames in os.walk(root_path):
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith(".") and d not in SKIP_DIRS)
+        for fname in sorted(filenames):
+            if not fname.endswith(".py"):
+                continue
+            fpath = os.path.join(dirpath, fname)
+            rel = os.path.relpath(fpath, root_path)
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                    src = f.read()
+            except Exception:
+                unreadable_files.append(rel)
                 continue
 
-        skipped = len(prepared) - i
-        break
+            try:
+                tree = ast.parse(src, filename=fpath)
+            except SyntaxError:
+                syntax_error_files.append(rel)
+                continue
 
-    # ── build final output (accurate header count) ──
-    header = make_header(len(body_lines))
-    extra = ""
-    if skipped > 0:
-        extra = f"char limit {max_chars} reached ({skipped} more match(es) omitted)"
+            f_defs, f_refs = _collect_file_symbols(tree, rel, target_symbol)
+            all_defs.extend(f_defs)
+            all_refs.extend(f_refs)
 
-    out = header
-    if body_lines:
-        out += "\n" + "\n".join(body_lines)
-    out += build_status(extra)
+    if mode == "symbols":
+        target_last = target_symbol.split(".")[-1]
+        matching_defs = [
+            d for d in all_defs
+            if d.name == target_last or d.qualified_name == target_symbol
+        ]
+        matching_defs.sort(key=lambda d: (d.relpath, d.lineno, d.qualified_name))
+        all_refs.sort(key=lambda r: (r.relpath, r.lineno, r.enclosing_def))
 
-    return hard_clip(out)
+        total_defs = len(matching_defs)
+        total_refs = len(all_refs)
+
+        defs_to_take = min(total_defs, max_results)
+        refs_to_take = min(total_refs, max_results - defs_to_take)
+
+        shown_defs = matching_defs[:defs_to_take]
+        shown_refs = all_refs[:refs_to_take]
+
+        def render_symbols(cur_defs: list[_SymDef], cur_refs: list[_SymRef]) -> str:
+            om_defs = total_defs - len(cur_defs)
+            om_refs = total_refs - len(cur_refs)
+
+            def_word = "definition" if len(cur_defs) == 1 else "definitions"
+            ref_word = "reference" if len(cur_refs) == 1 else "references"
+            hdr = f"# symbols: {target_symbol} \u2014 {len(cur_defs)} {def_word}, {len(cur_refs)} {ref_word}"
+
+            lines = [hdr]
+            if unreadable_files:
+                skipped_paths = ", ".join(unreadable_files[:3])
+                if len(unreadable_files) > 3:
+                    skipped_paths += "..."
+                lines.append(f"# warning: {len(unreadable_files)} file(s) unreadable (skipped: {skipped_paths}); search may be incomplete")
+
+            lines.append("## definitions")
+            for d in cur_defs:
+                lines.append(f"  {d.relpath}:L{d.lineno} {d.kind} {d.qualified_name}")
+
+            lines.append("## references")
+            for r in cur_refs:
+                lines.append(f"  {r.relpath}:L{r.lineno} in {r.enclosing_def}")
+
+            if om_defs > 0 or om_refs > 0:
+                lines.append(f"(omitted: {om_defs} definitions, {om_refs} references)")
+
+            return "\n".join(lines)
+
+        rendered = render_symbols(shown_defs, shown_refs)
+        while len(rendered) > max_chars and shown_refs:
+            shown_refs.pop()
+            rendered = render_symbols(shown_defs, shown_refs)
+        while len(rendered) > max_chars and shown_defs:
+            shown_defs.pop()
+            rendered = render_symbols(shown_defs, shown_refs)
+
+        if len(rendered) > max_chars:
+            rendered = rendered[:max_chars]
+        return rendered
+
+    # mode == "related"
+    target_last = target_symbol.split(".")[-1]
+    matching_defs = [
+        d for d in all_defs
+        if d.name == target_last or d.qualified_name == target_symbol
+    ]
+    matching_defs.sort(key=lambda d: (d.relpath, d.lineno, d.qualified_name))
+
+    if symbol_file:
+        norm_sf = os.path.normpath(symbol_file)
+        filtered = [
+            d for d in matching_defs
+            if os.path.normpath(d.relpath) == norm_sf or d.relpath.endswith(symbol_file)
+        ]
+        if filtered:
+            matching_defs = filtered
+
+    if not matching_defs:
+        warn = f"\n# warning: {len(unreadable_files)} file(s) unreadable; search may be incomplete" if unreadable_files else ""
+        return f"# related: no definition found for '{target_symbol}'{warn}"
+
+    if len(matching_defs) > 1 and not symbol_file:
+        lines = [
+            f"# multiple definitions found \u2014 specify a file with target_symbol:",
+            f'# target_symbol="{target_symbol}" and pass symbol_file="<relpath>"',
+        ]
+        for d in matching_defs:
+            lines.append(f"  {d.relpath}:L{d.lineno} {d.kind} {d.qualified_name}")
+        return "\n".join(lines)
+
+    seed = matching_defs[0]
+
+    if not isinstance(depth, int) or isinstance(depth, bool):
+        try:
+            depth = int(depth)
+        except (TypeError, ValueError):
+            depth = 2
+    depth = max(1, min(depth, 3))
+
+    defs_by_name: dict[str, list[_SymDef]] = {}
+    for d in all_defs:
+        defs_by_name.setdefault(d.name, []).append(d)
+        if "." in d.qualified_name:
+            defs_by_name.setdefault(d.qualified_name, []).append(d)
+
+    def _get_body_references(d_obj: _SymDef) -> set[str]:
+        ref_names: set[str] = set()
+        body_nodes = getattr(d_obj.node, "body", [])
+        for b in body_nodes:
+            for child in ast.walk(b):
+                if isinstance(child, ast.Name):
+                    if child.id not in {"self", "cls"}:
+                        ref_names.add(child.id)
+                elif isinstance(child, ast.Attribute):
+                    ref_names.add(child.attr)
+        return ref_names
+
+    queue: list[tuple[_SymDef, int]] = [(seed, 0)]
+    visited_keys: set[tuple[str, int, str]] = {seed.key}
+    hop_results: list[tuple[_SymDef, int]] = []
+
+    while queue:
+        curr_def, curr_hop = queue.pop(0)
+        if curr_hop >= depth:
+            continue
+
+        ref_names = _get_body_references(curr_def)
+        targets_for_hop: list[_SymDef] = []
+        seen_target_keys: set[tuple[str, int, str]] = set()
+
+        for rname in sorted(ref_names):
+            for candidate in defs_by_name.get(rname, []):
+                if candidate.key not in visited_keys and candidate.key not in seen_target_keys:
+                    seen_target_keys.add(candidate.key)
+                    targets_for_hop.append(candidate)
+
+        targets_for_hop.sort(key=lambda x: (x.relpath, x.lineno, x.qualified_name))
+
+        for target in targets_for_hop:
+            visited_keys.add(target.key)
+            hop_results.append((target, curr_hop + 1))
+            queue.append((target, curr_hop + 1))
+
+    max_hop = max((h for _, h in hop_results), default=0)
+    total_results = len(hop_results)
+
+    shown_hops = hop_results[:max_results]
+
+    def render_related(cur_hops: list[tuple[_SymDef, int]]) -> str:
+        lines = [f"# related: {seed.qualified_name} (depth={depth})"]
+        if unreadable_files:
+            skipped_paths = ", ".join(unreadable_files[:3])
+            if len(unreadable_files) > 3:
+                skipped_paths += "..."
+            lines.append(f"# warning: {len(unreadable_files)} file(s) unreadable (skipped: {skipped_paths}); search may be incomplete")
+
+        for d, h in cur_hops:
+            lines.append(f"{d.relpath}:L{d.lineno} {d.kind} {d.qualified_name}   [hop={h}]")
+
+        lines.append(f"(max hop reached: {max_hop})")
+        omitted = total_results - len(cur_hops)
+        if omitted > 0:
+            lines.append(f"(omitted: {omitted} results)")
+        return "\n".join(lines)
+
+    rendered = render_related(shown_hops)
+    while len(rendered) > max_chars and shown_hops:
+        shown_hops.pop()
+        rendered = render_related(shown_hops)
+
+    if len(rendered) > max_chars:
+        rendered = rendered[:max_chars]
+    return rendered
 
 # ═══════════════════════════════════════════════════════════
 # B. Surgical code modification
