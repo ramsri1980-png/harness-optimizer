@@ -1,0 +1,3 @@
+    Hello from the CTX fixture.
+    This text must appear in the outgoing request when the user message
+    mentions "ctx_fixtures/hello.txt".

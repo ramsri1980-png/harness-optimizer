@@ -8,6 +8,7 @@ venv/
 
 # Tests
 tests/
+tests/ctx_fixtures/
 
 # Scratch files
 *.bak
