@@ -31,6 +31,9 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PLUGIN = os.path.join(REPO_ROOT, "templates", "auto-context.ts")
 FIXTURE_SRC = os.path.join(REPO_ROOT, "tests", "ctx_fixtures", "hello.txt")
 LIB_FIXTURE_SRC = os.path.join(REPO_ROOT, "tests", "ctx_fixtures", "lib", "util.py")
+MAP_FIXTURE_SRC = os.path.join(REPO_ROOT, "tests", "ctx_fixtures", "map_fixture.py")
+WORKER_SRC = os.path.join(REPO_ROOT, "templates", "context_worker.py")
+HARNESS_CORE_SRC = os.path.join(REPO_ROOT, "templates", "harness_core")
 
 STUB_PATH = "/tmp/opencode/ctx_spike/stub_provider.py"
 STUB_OUT = "/tmp/opencode/ctx_spike/request.jsonl"
@@ -42,6 +45,21 @@ PROMPT = "Please look at ctx_fixtures/hello.txt and tell me what it says."
 GEN_PROMPT = "hi, how are you today?"
 MISSING_PROMPT = "Please look at ctx_fixtures/nonexistent.py and tell me what it says."
 LIB_PROMPT = "Please look at ctx_fixtures/lib/util.py and tell me what it says."
+MAP_PROMPT = "How is this repository structured? Give me a brief overview."
+# Ranked-map entries render as `<relpath>:L<n> <kind> <name>`; the brief's
+# "file:L<n> def <name>" means the file path may carry directories/extension.
+MAP_DEF_LINE_RE = re.compile(r"\S+:L\d+ def \w+")
+WORKER_PROC = "context_worker.py"
+# Second language for the MAP workspace (see main()); Python alone would
+# not produce the ranked map's `# languages:` header line.
+MAP_JS_FIXTURE = """function summarize(entries) {
+  return entries.length;
+}
+
+function rankEntries(entries) {
+  return entries.slice().sort();
+}
+"""
 EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 SHA_LINE_RE = re.compile(r"^# sha256: ([0-9a-f]{64})$", re.MULTILINE)
 SOURCE_LINE_RE = re.compile(r"^# source: (.+)$", re.MULTILINE)
@@ -426,6 +444,55 @@ def _check_api09(env, workspace):
         "marker=%s sha256=%s content=%s"
         % (MARKER in text, digest.group(1) if digest else "<missing>", "def helper" in text),
     )
+def _check_api04(env, workspace):
+    """CTX-API-04: a repo question naming no file injects the ranked map."""
+    bodies, _raw = _run_prompt(env, workspace, MAP_PROMPT, "map-repo-question")
+    primary = _primary_body(bodies)
+    text = _body_text(primary)
+    marker = MARKER in text
+    source = "# source: <ranked-map>" in text
+    header = "# ranked source map" in text
+    languages = "# languages:" in text
+    file_defs = MAP_DEF_LINE_RE.findall(text)
+    ok = (
+        primary is not None
+        and marker
+        and source
+        and header
+        and languages
+        and len(file_defs) >= 3
+    )
+    return _check(
+        "CTX-API-04: repo question injects the ranked map (no tool call)",
+        ok,
+        "captured=%d marker=%s source=%s header=%s languages=%s defs=%d"
+        % (len(bodies), marker, source, header, languages, len(file_defs)),
+    )
+
+
+def _worker_pids():
+    """PIDs of any running ``python3 .../context_worker.py`` processes."""
+    proc = subprocess.run(["pgrep", "-f", WORKER_PROC], capture_output=True)
+    if proc.returncode != 0:
+        return []
+    return [
+        line.strip()
+        for line in proc.stdout.decode("utf-8", "replace").splitlines()
+        if line.strip()
+    ]
+
+
+def _check_api07(pre_pids):
+    """CTX-API-07: the MAP run leaves no orphan worker behind."""
+    time.sleep(2)
+    post = _worker_pids()
+    ok = not pre_pids and not post
+    return _check(
+        "CTX-API-07: no orphan context_worker.py after the MAP run",
+        ok,
+        "workers before=%d after=%d" % (len(pre_pids), len(post)),
+    )
+
 
 def main():
     for label, path in (
@@ -433,8 +500,11 @@ def main():
         ("plugin", PLUGIN),
         ("fixture", FIXTURE_SRC),
         ("lib fixture", LIB_FIXTURE_SRC),
+        ("map fixture", MAP_FIXTURE_SRC),
+        ("context worker", WORKER_SRC),
+        ("harness_core", HARNESS_CORE_SRC),
     ):
-        if not os.path.isfile(path):
+        if not os.path.exists(path):
             if label == "stub provider":
                 print("SKIP: %s not present at %s — CTX smoke test skipped." % (label, path))
                 return 0
@@ -481,6 +551,20 @@ def main():
         shutil.copyfile(
             LIB_FIXTURE_SRC, os.path.join(workspace, "ctx_fixtures", "lib", "util.py")
         )
+        # CTX Day 5: a named-symbol fixture so the ranked map has at least
+        # one non-trivial Python file to rank in the MAP workspace.
+        shutil.copyfile(
+            MAP_FIXTURE_SRC, os.path.join(workspace, "ctx_fixtures", "map_fixture.py")
+        )
+        # A second source language: repomap_adapter only emits its
+        # `# languages:` header when more than one language contributes
+        # files, and CTX-API-04 asserts that line is present.
+        with open(
+            os.path.join(workspace, "ctx_fixtures", "worker_helper.js"),
+            "w",
+            encoding="utf-8",
+        ) as fh:
+            fh.write(MAP_JS_FIXTURE)
 
         # OpenCode v2.0.24 rejects a bare file in `plugins`
         # ("configured plugin path must be a directory"), so hand it a
@@ -488,6 +572,18 @@ def main():
         plugin_dir = os.path.join(config_dir, "plugins")
         os.makedirs(plugin_dir)
         shutil.copyfile(PLUGIN, os.path.join(plugin_dir, "auto-context.ts"))
+
+        # CTX Day 5: the plugin resolves the worker next to itself
+        # (`WORKER_DIR/context_worker.py`) with `../harness_core` as its
+        # import root, so lay out the same shape install.js produces.
+        shutil.copyfile(
+            WORKER_SRC, os.path.join(plugin_dir, "context_worker.py")
+        )
+        shutil.copytree(
+            HARNESS_CORE_SRC,
+            os.path.join(config_dir, "harness_core"),
+            ignore=shutil.ignore_patterns("__pycache__"),
+        )
 
         config = {
             "$schema": "https://opencode.ai/config.json",
@@ -516,6 +612,17 @@ def main():
             "OPENCODE_TEST_HOME": home_dir,
             "OPENCODE_DISABLE_MODELS_FETCH": "1",
         }
+
+        # Isolation: the worker is spawned as a bare `python3` by the plugin,
+        # so the repo venv must lead the child's PATH even when the caller
+        # never activated it.  Without this the worker cannot import
+        # grep_ast/networkx/tree_sitter, silently fails open, and the MAP
+        # packet (CTX-API-04) is never produced.  Prepended here so every
+        # `opencode run` below (primary, general-conversation, missing-file,
+        # lib-fixture, map-repo-question) inherits the same corrected PATH.
+        venv_bin = os.path.join(REPO_ROOT, "venv", "bin")
+        existing_path = os.environ.get("PATH", "/usr/bin:/bin")
+        env["PATH"] = venv_bin + os.pathsep + existing_path
 
         print("\n[opencode] running standalone against the stub provider ...")
         proc = subprocess.run(
@@ -563,6 +670,13 @@ def main():
         ok &= _check_api06(env, workspace, first_source, first_digest)
         ok &= _check_api08(env, workspace)
         ok &= _check_api09(env, workspace)
+
+        # CTX Day 5 checks: MAP branch + worker lifecycle.  Record worker
+        # PIDs before the MAP run so CTX-API-07 can prove the plugin cleans
+        # up after itself (brief: should be none).
+        pre_worker_pids = _worker_pids()
+        ok &= _check_api04(env, workspace)
+        ok &= _check_api07(pre_worker_pids)
 
         print("\n%d/%d checks passed" % (sum(1 for _, c in check_results if c), len(check_results)))
         return 0 if ok else 1

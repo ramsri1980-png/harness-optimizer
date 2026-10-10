@@ -1,5 +1,6 @@
-// CTX Day 2 — auto-context plugin: gate + inject a labeled reference-data
-// packet into the outgoing model request.
+// CTX Day 5 — auto-context plugin: gate + inject a labeled reference-data
+// packet into the outgoing model request.  The MAP branch spawns a lazy
+// Python worker to produce a ranked repo map (no tool call).
 //
 // Decision gate (NONE / REUSE / FOCUSED / MAP) decides WHETHER to inject.
 // Only FOCUSED currently injects. MAP is detected but the repomap engine
@@ -18,8 +19,10 @@
 //   - Fails open: any error leaves the request unmodified.
 
 import { createHash } from "crypto"
-import { readFileSync, realpathSync, statSync } from "fs"
-import { isAbsolute, relative, resolve, sep } from "path"
+import { existsSync, readFileSync, realpathSync, statSync } from "fs"
+import { spawn, type ChildProcess } from "child_process"
+import { fileURLToPath } from "url"
+import { dirname, isAbsolute, join, relative, resolve, sep } from "path"
 
 const MAX_BYTES = 8192
 const HEADER = "[HARNESS REPOSITORY CONTEXT — reference data]"
@@ -27,6 +30,262 @@ const FOOTER = "[/HARNESS REPOSITORY CONTEXT]"
 
 const PATH_RE =
   /(?<![A-Za-z0-9_])([A-Za-z0-9_./-]+\.(py|ts|tsx|js|jsx|json|md|toml|yaml|yml|txt))/g
+
+// --- CTX Day 5: lazy MAP worker client ---------------------------------------
+
+// Resolve the worker script next to this plugin.  The plugin is loaded
+// by the OpenCode binary from a copied directory (see the test harness
+// comment about "configured plugin path must be a directory"), so we key
+// off our own source location rather than process.cwd().  fileURLToPath
+// is only needed when this file is imported as a module URL; in the
+// bundled runtime __filename is already an absolute path, and the
+// dirname() call below is a no-op in that case.
+const __filename = (() => {
+  try {
+    return typeof __filename !== "undefined"
+      ? __filename
+      : fileURLToPath(import.meta.url)
+  } catch {
+    return ""
+  }
+})()
+
+const WORKER_DIR = (() => {
+  try {
+    const d = dirname(__filename || "")
+    if (d) return d
+  } catch {}
+  return process.cwd()
+})()
+
+const WORKER_PATH = (() => {
+  const candidates: string[] = []
+
+  // 1. Next to this plugin (the plugin dir is known via __filename/import.meta.url).
+  candidates.push(join(WORKER_DIR, "context_worker.py"))
+
+  // 2. In the OPENCODE_CONFIG_DIR plugins dir (real install location).
+  const configDir = process.env.OPENCODE_CONFIG_DIR
+  if (typeof configDir === "string" && configDir) {
+    candidates.push(join(configDir, "plugins", "context_worker.py"))
+    candidates.push(join(configDir, "context_worker.py"))
+  }
+
+  // 3. Legacy ~/.config/opencode/plugins fallback.
+  const home = process.env.HOME
+  if (typeof home === "string" && home) {
+    candidates.push(join(home, ".config", "opencode", "plugins", "context_worker.py"))
+  }
+
+  // 4. Repo dev layout templates/ (for local testing when cwd=repo root).
+  candidates.push(join(process.cwd(), "templates", "context_worker.py"))
+
+  for (const c of candidates) {
+    try {
+      if (c && existsSync(c)) return c
+    } catch {}
+  }
+  // As a last resort, return the first candidate even if missing;
+  // the spawn will fail open and we'll log the error.
+  return candidates[0] || join(process.cwd(), "templates", "context_worker.py")
+})()
+
+let worker: ChildProcess | null = null
+let workerReady = false
+
+// Ring buffer for the worker's stderr (last 2 KiB) — useful when a MAP
+// request fails and we need to know why without corrupting stdout.
+const STDERR_RING_BYTES = 2048
+let stderrBuffer = ""
+
+function captureStderr(chunk: Buffer | string): void {
+  try {
+    stderrBuffer += typeof chunk === "string" ? chunk : chunk.toString("utf8")
+    if (stderrBuffer.length > STDERR_RING_BYTES) {
+      stderrBuffer = stderrBuffer.slice(-STDERR_RING_BYTES)
+    }
+    console.error("[harness.auto-context worker stderr]", typeof chunk === "string" ? chunk : chunk.toString("utf8"))
+  } catch {}
+}
+
+/**
+ * Replies arrive as a byte stream, so stdout is buffered and split on
+ * newlines; each complete line is handed to the oldest waiter (FIFO).
+ * One request in flight at a time is enough for CTX Day 5 — no pools.
+ */
+type PendingReply = {
+  done: boolean
+  settle: (value: any | null) => void
+}
+
+const replyQueue: PendingReply[] = []
+let stdoutBuffer = ""
+
+/** Hand one reply line to the oldest waiter; unparseable → null (fail open). */
+function onWorkerLine(line: string): void {
+  let parsed: any
+  try {
+    parsed = JSON.parse(line)
+  } catch {
+    try {
+      console.error("[harness.auto-context] worker reply was not JSON:", line.slice(0, 200))
+    } catch {}
+    parsed = null
+  }
+  while (replyQueue.length > 0) {
+    const entry = replyQueue.shift()!
+    if (!entry.done) {
+      entry.settle(parsed)
+      return
+    }
+  }
+}
+
+/** The worker died with waiters outstanding: settle them all with null. */
+function drainQueue(): void {
+  while (replyQueue.length > 0) {
+    const entry = replyQueue.shift()!
+    if (!entry.done) entry.settle(null)
+  }
+}
+
+/** Spawn (once) and wire up the lazy MAP worker. */
+function ensureWorker(): ChildProcess | null {
+  if (worker !== null && workerReady) return worker
+
+  let child: ChildProcess
+  try {
+    child = spawn("python3", [WORKER_PATH], {
+      stdio: ["pipe", "pipe", "pipe"],
+    })
+  } catch (err) {
+    console.error("[harness.auto-context] worker spawn failed:", err)
+    worker = null
+    workerReady = false
+    return null
+  }
+
+  worker = child
+  workerReady = true
+  stdoutBuffer = ""
+
+  child.stderr?.on("data", (chunk: Buffer) => captureStderr(chunk))
+
+  child.stdout?.on("data", (chunk: Buffer) => {
+    stdoutBuffer += chunk.toString("utf8")
+    let idx: number
+    while ((idx = stdoutBuffer.indexOf("\n")) >= 0) {
+      const line = stdoutBuffer.slice(0, idx)
+      stdoutBuffer = stdoutBuffer.slice(idx + 1)
+      if (line.trim()) onWorkerLine(line)
+    }
+  })
+  child.stdout?.on("error", (err: Error) => {
+    try {
+      console.error("[harness.auto-context] worker stdout error:", err.message)
+    } catch {}
+    drainQueue()
+  })
+
+  // Never let a broken pipe become an unhandled stream error.
+  child.stdin?.on("error", (err: Error) => {
+    try {
+      console.error("[harness.auto-context] worker stdin error:", err.message)
+    } catch {}
+    drainQueue()
+  })
+
+  child.on("exit", () => {
+    // Only clear module state if this child is still the current one.
+    if (worker === child) {
+      worker = null
+      workerReady = false
+    }
+    drainQueue()
+  })
+  child.on("error", (err: Error) => {
+    try {
+      console.error("[harness.auto-context] worker error:", err.message)
+    } catch {}
+    if (worker === child) {
+      worker = null
+      workerReady = false
+    }
+    drainQueue()
+  })
+
+  return child
+}
+
+/**
+ * Sends one request and resolves with its parsed reply.
+ *
+ * On timeout the child this call spawned is killed and null is returned;
+ * on any parse error, write error, or worker exit the same happens, so
+ * the caller always fails open instead of blocking the request.
+ */
+async function callWorker(request: object, timeoutMs: number): Promise<any | null> {
+  try {
+    const child = ensureWorker()
+    if (!child || !child.stdin || !child.stdout) return null
+
+    return await new Promise<any | null>((resolve) => {
+      let timer: any = null
+      let entry: PendingReply | null = null
+
+      const finish = (value: any | null): void => {
+        if (entry && entry.done) return
+        if (entry) entry.done = true
+        if (timer) clearTimeout(timer)
+        if (entry) {
+          const at = replyQueue.indexOf(entry)
+          if (at >= 0) replyQueue.splice(at, 1)
+        }
+        resolve(value)
+      }
+
+      entry = { done: false, settle: finish }
+      replyQueue.push(entry)
+
+      timer = setTimeout(() => {
+        try {
+          console.error(
+            "[harness.auto-context] worker timed out after %dms; killing",
+            timeoutMs,
+            stderrBuffer ? " stderr=" + stderrBuffer.slice(-200) : "",
+          )
+        } catch {}
+        try {
+          child.kill("SIGTERM")
+        } catch {}
+        finish(null)
+      }, timeoutMs)
+
+      try {
+        child.stdin.write(JSON.stringify(request) + "\n", (err?: Error | null) => {
+          if (err) {
+            try {
+              console.error("[harness.auto-context] worker stdin write failed:", err)
+            } catch {}
+            finish(null)
+          }
+        })
+      } catch (err) {
+        try {
+          console.error("[harness.auto-context] worker stdin write threw:", err)
+        } catch {}
+        finish(null)
+      }
+    })
+  } catch (err) {
+    try {
+      console.error("[harness.auto-context] callWorker failed:", err)
+    } catch {}
+    return null
+  }
+}
+
+// --- end worker client -------------------------------------------------------
 
 /** Day 1 = at most one file per request. Returns the first path-looking token. */
 function extractPath(text: string): string | null {
@@ -237,8 +496,12 @@ export type GateDecision = "NONE" | "REUSE" | "FOCUSED" | "MAP"
 
 /**
  * Deliberately short, explicit list of repo-orientation phrasings.
- * This is a stub for Day 3's real MAP detection — false negatives are fine
- * (the user can always name a file explicitly).
+ * Everything except the `architecture of` / `where is` clauses still
+ * requires an explicit repo/project/codebase mention, so a plain
+ * conversational prompt ("hi, how are you today?") stays NONE.
+ * The `structure`/`overview` clauses are the broad forms of the Day 2
+ * `structure of the` / `overview of the` probes so that
+ * "How is this repository structured?" reads as a MAP signal.
  */
 function looksLikeRepoQuestion(text: string): boolean {
   const t = text.toLowerCase()
@@ -247,8 +510,8 @@ function looksLikeRepoQuestion(text: string): boolean {
   if (t.includes("where is") && (t.includes("implemented") || t.includes("defined") || t.includes("used"))) return true
   if (t.includes("how does the") && mentionsRepo) return true
   if (t.includes("architecture of")) return true
-  if (t.includes("structure of the") && mentionsRepo) return true
-  if (t.includes("overview of the") && mentionsRepo) return true
+  if (t.includes("structure") && mentionsRepo) return true
+  if (t.includes("overview") && mentionsRepo) return true
   return false
 }
 
@@ -310,7 +573,7 @@ export default {
   async setup(ctx: any) {
     if (process.env.HARNESS_CTX === "off") return
 
-    const registration = await ctx.session.hook("context", (event: any) => {
+    const registration = await ctx.session.hook("context", async (event: any) => {
       try {
         if (process.env.HARNESS_CTX === "off") return
         const messages = event?.messages
@@ -328,11 +591,61 @@ export default {
 
         // REUSE: a fresh, matching packet is already in messages — leave it as-is.
         if (gate.decision === "REUSE") return
-        // MAP: detected, but the repomap engine is Day 3 — log only.
+        // MAP: spawn a lazy Python worker to produce a ranked repo map,
+        // inject it as a single labeled packet (no tool call).  The worker's
+        // in-process fingerprint cache (Day 3) makes repeat calls cheap; this
+        // branch always spawns on every repo question — the worker handles
+        // deduplication via its own cache, so we do not REUSE here.
         if (gate.decision === "MAP") {
           try {
-            console.error("[harness.auto-context] MAP signal — engine not wired (Day 3). token=null")
-          } catch {}
+            const mapReply = await callWorker(
+              { cmd: "map", root, max_tokens: 1500 },
+              30000,
+            )
+            if (!mapReply || !mapReply.ok || typeof mapReply.text !== "string"
+                || !mapReply.text.trim()) {
+              // Fail open — do not block the request.
+              return
+            }
+
+            // Idempotency: remove any stale harness-owned packet first
+            // (same as FOCUSED).
+            for (let i = messages.length - 1; i >= 0; i--) {
+              const metadata = messages[i]?.metadata
+              if (metadata && metadata.harness_auto_context === true) {
+                messages.splice(i, 1)
+              }
+            }
+
+            const digest = createHash("sha256").update(mapReply.text, "utf8").digest("hex")
+            if (!digest) {
+              return
+            }
+            const packet = [
+              HEADER,
+              "# source: <ranked-map>",
+              `# sha256: ${digest}`,
+              `# bytes: ${mapReply.text.length} (truncated: no)`,
+              "",
+              mapReply.text,
+              FOOTER,
+            ].join("\n")
+
+            const target = lastUserText(messages)
+            if (!target) return
+
+            messages.splice(target.index, 0, {
+              id: "ctx_" + Date.now().toString(36),
+              role: "user",
+              content: [{ type: "text", text: packet }],
+              metadata: { harness_auto_context: true },
+            })
+          } catch (err) {
+            // Fail open: any worker error leaves the request unmodified.
+            try {
+              console.error("[harness.auto-context] MAP worker failed:", err)
+            } catch {}
+          }
           return
         }
         if (gate.decision === "NONE") return
@@ -370,6 +683,14 @@ export default {
       try {
         registration?.dispose?.()
       } catch {}
+      // CTX Day 5: kill the lazy MAP worker so it never outlives the plugin.
+      if (worker !== null) {
+        try {
+          worker.kill("SIGTERM")
+        } catch {}
+        worker = null
+        workerReady = false
+      }
     }
   },
 }
