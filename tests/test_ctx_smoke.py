@@ -20,6 +20,7 @@ evidence is never disturbed. When the stub is absent the test skips (exit 0).
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -37,6 +38,9 @@ STUB_READY = "listening on 127.0.0.1:8123"
 MARKER = "[HARNESS REPOSITORY CONTEXT — reference data]"
 FIXTURE_SNIPPET = "Hello from the CTX fixture."
 PROMPT = "Please look at ctx_fixtures/hello.txt and tell me what it says."
+GEN_PROMPT = "hi, how are you today?"
+EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+SHA_LINE_RE = re.compile(r"^# sha256: ([0-9a-f]{64})$", re.MULTILINE)
 
 BOOT_TIMEOUT = 30
 RUN_TIMEOUT = 180
@@ -217,6 +221,97 @@ def _run_assertions(bodies, raw):
     return ok
 
 
+def _primary_body(bodies):
+    """The primary agent request: the largest captured body.
+
+    Auxiliary requests (title generation) are far smaller than the primary
+    loop request — see docs/ctx-spike-findings.md §6 (2446 vs 21162 bytes).
+    """
+    candidates = [b for b in bodies if isinstance(b, dict) and isinstance(b.get("messages"), list)]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda b: len(json.dumps(b)))
+
+
+def _is_title_request(body):
+    """A title request carries a system message mentioning the title generator."""
+    for message in body.get("messages", []):
+        if not isinstance(message, dict) or message.get("role") != "system":
+            continue
+        for text in _message_texts(message):
+            if "title generator" in text.lower():
+                return True
+    return False
+
+
+def _check_api01(bodies):
+    """No title-generation request may carry the harness packet."""
+    title_bodies = [b for b in bodies if isinstance(b, dict) and _is_title_request(b)]
+    marker_free = all(MARKER not in json.dumps(b) for b in title_bodies)
+    if title_bodies:
+        detail = "title_requests=%d" % len(title_bodies)
+    else:
+        detail = "title_requests=0 (none observed)"
+    return _check(
+        "CTX-API-01: title request has no packet",
+        marker_free,
+        detail,
+    )
+
+
+def _check_api05(bodies):
+    """The injected packet must carry a real (non-empty) sha256 fingerprint."""
+    primary = _primary_body(bodies)
+    digest = None
+    if primary is not None:
+        for message in primary.get("messages", []):
+            for text in _message_texts(message):
+                match = SHA_LINE_RE.search(text)
+                if match:
+                    digest = match.group(1)
+                    break
+            if digest:
+                break
+    ok = bool(digest) and digest != EMPTY_SHA256
+    if digest:
+        print("[packet] # sha256: %s" % digest)
+    return _check(
+        "CTX-API-05: packet has a real sha256 fingerprint",
+        ok,
+        "sha256=%s" % (digest or "<missing>"),
+    )
+
+
+def _check_api03(env, workspace):
+    """A plain conversational prompt must produce no packet at all."""
+    offset = os.path.getsize(STUB_OUT) if os.path.isfile(STUB_OUT) else 0
+    proc = subprocess.run(
+        ["opencode", "run", "--standalone", "--auto", "-m", "stub/stub-1", GEN_PROMPT],
+        cwd=workspace,
+        env=env,
+        capture_output=True,
+        timeout=RUN_TIMEOUT,
+    )
+    print("[opencode] general-conversation run exit=%s" % proc.returncode)
+
+    bodies, raw = _read_appended(offset)
+    raw_text = raw.decode("utf-8", "replace")
+    print("[stub] captured %d request body/bodies from the general-conversation run" % len(bodies))
+
+    primary = _primary_body(bodies)
+    marker_present = MARKER in raw_text
+    source_line_present = (
+        "# source:" in json.dumps(primary) if primary is not None else None
+    )
+    ok = len(bodies) > 0 and not marker_present and source_line_present is False
+    return _check(
+        "CTX-API-03: general conversation produces no packet",
+        ok,
+        "captured=%d marker=%s source_line=%s"
+        % (len(bodies), marker_present, source_line_present),
+    )
+
+
 def main():
     for label, path in (
         ("stub provider", STUB_PATH),
@@ -321,6 +416,12 @@ def main():
         print("\n[stub] captured %d request body/bodies from %s" % (len(bodies), STUB_OUT))
 
         ok = _run_assertions(bodies, raw)
+
+        # CTX Day 2 checks, reusing the same stub and the same captured run.
+        ok &= _check_api01(bodies)
+        ok &= _check_api05(bodies)
+        ok &= _check_api03(env, workspace)
+
         print("\n%d/%d checks passed" % (sum(1 for _, c in check_results if c), len(check_results)))
         return 0 if ok else 1
 
