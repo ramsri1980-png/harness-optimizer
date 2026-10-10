@@ -24,6 +24,11 @@ const FLAGS = {
   noRuntime: process.argv.includes("--no-runtime"),
   withPlugins: process.argv.includes("--with-plugins"),
 };
+// CTX: opt-in auto-context deployment (see "Phase: Auto-Context" below).
+// Kept as its own const rather than a FLAGS entry so it reads as a
+// first-class option next to the ones above; the doctor and uninstall
+// blocks reference the same variable.
+const withContext = process.argv.includes("--with-context");
 // ── Helpers ──
 function sha256(buf) {
   return crypto.createHash("sha256").update(buf).digest("hex");
@@ -174,6 +179,29 @@ if (FLAGS.uninstall) {
     if (fs.existsSync(f)) { fs.rmSync(f); info(`Removed ${f}`); }
   }
 
+  // ── Auto-context (CTX) cleanup — opt-in, only with --with-context ──
+  // Remove ONLY what --with-context installed: plugins/auto-context.ts,
+  // plugins/context_worker.py, and CONFIG_DIR/harness_core. Never touch
+  // plugins/harness.ts (token-metrics) or the MCP runtime harness_core
+  // under TOOLS_DIR.
+  if (withContext) {
+    for (const p of [
+      path.join(PLUGINS_DIR, "auto-context.ts"),
+      path.join(PLUGINS_DIR, "context_worker.py"),
+    ]) {
+      if (fs.existsSync(p)) {
+        try { fs.unlinkSync(p); info(`Removed ${p}`); } catch {}
+      }
+    }
+    const hcUninstall = path.join(CONFIG_DIR, "harness_core");
+    if (fs.existsSync(hcUninstall)) {
+      try {
+        fs.rmSync(hcUninstall, { recursive: true, force: true });
+        info(`Removed ${hcUninstall}`);
+      } catch {}
+    }
+  }
+
   // AGENTS.md uninstall — marker-aware + backup-safe
   //   1. Valid markers in current file → strip section, preserve outside
   //      (if nothing left outside AND a backup exists → restore backup)
@@ -301,6 +329,23 @@ asyncio.run(main())
   }
   check("harness.ts plugin",
     fs.existsSync(path.join(PLUGINS_DIR, "harness.ts")));
+
+  // Auto-context (CTX) checks — only meaningful when the doctor run was
+  // invoked with the same --with-context flag used to install it, so a
+  // plain --doctor never reports failures for an opt-in feature.
+  if (withContext) {
+    const acPath = path.join(PLUGINS_DIR, "auto-context.ts");
+    check("auto-context plugin installed",
+          fs.existsSync(acPath));
+
+    const cwPath = path.join(PLUGINS_DIR, "context_worker.py");
+    check("context_worker.py installed",
+          fs.existsSync(cwPath));
+
+    const hcPath = path.join(CONFIG_DIR, "harness_core", "__init__.py");
+    check("harness_core installed for auto-context",
+          fs.existsSync(hcPath));
+  }
 
   check("config UI present",
     fs.existsSync(path.join(TOOLS_DIR, "harness-config-ui.py")));
@@ -550,6 +595,46 @@ info("Installed harness.ts");
 if (!fs.existsSync(METRICS_FILE)) {
   fs.writeFileSync(METRICS_FILE, JSON.stringify({ totalSaved: 0, calls: 0 }) + "\n");
   info("Initialized persistent token totals.");
+}
+
+// ── Auto-context (CTX) — opt-in via --with-context ────────────
+// Placed AFTER the token-metrics plugin install so it can never
+// interfere with harness.ts handling. Deploys:
+//   plugins/auto-context.ts      — the plugin itself
+//   plugins/context_worker.py    — MAP worker; sys.path.insert(dirname+"/..")
+//                                  resolves to CONFIG_DIR, so harness_core
+//                                  must live directly under CONFIG_DIR
+//   CONFIG_DIR/harness_core/     — worker runtime package
+if (withContext) {
+  head("Phase: Auto-Context (CTX)");
+  fs.mkdirSync(PLUGINS_DIR, { recursive: true });
+
+  const acSrc = path.join(__dirname, "..", "templates", "auto-context.ts");
+  const acDst = path.join(PLUGINS_DIR, "auto-context.ts");
+  if (!fs.existsSync(acSrc)) fail("templates/auto-context.ts missing from package");
+  fs.copyFileSync(acSrc, acDst);
+  info("Installed auto-context.ts");
+
+  const cwSrc = path.join(__dirname, "..", "templates", "context_worker.py");
+  const cwDst = path.join(PLUGINS_DIR, "context_worker.py");
+  if (!fs.existsSync(cwSrc)) fail("templates/context_worker.py missing from package");
+  fs.copyFileSync(cwSrc, cwDst);
+  info("Installed context_worker.py");
+
+  const hcSrc = path.join(__dirname, "..", "templates", "harness_core");
+  const hcDst = path.join(CONFIG_DIR, "harness_core");
+  if (!fs.existsSync(hcSrc)) fail("templates/harness_core missing from package");
+  fs.rmSync(hcDst, { recursive: true, force: true });
+  fs.cpSync(hcSrc, hcDst, {
+    recursive: true,
+    filter: (src) => !src.includes("__pycache__") &&
+                     !src.endsWith(".pyc"),
+  });
+  info("Installed harness_core for auto-context");
+
+  info("Auto-context enabled. Restart OpenCode to load the plugin.");
+} else {
+  info("Auto-context not requested (pass --with-context to enable).");
 }
 
 head("Phase: Custom Commands");
