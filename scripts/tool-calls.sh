@@ -1,11 +1,5 @@
 #!/usr/bin/env bash
 # scripts/tool-calls.sh — summarize harness tool usage from the metrics log.
-#
-# Usage:
-#   scripts/tool-calls.sh           # today's summary
-#   scripts/tool-calls.sh --all     # all-time summary
-#   scripts/tool-calls.sh --watch   # refresh every 3s
-#   scripts/tool-calls.sh --live    # tail -f style
 
 set -euo pipefail
 
@@ -25,38 +19,61 @@ filter_today() {
   grep -E "^\[${today}T" "$LOG" || true
 }
 
+fmt_num() {
+  printf "%'d" "$1" 2>/dev/null || printf "%d" "$1"
+}
+
 summary() {
   local stream="$1"
-  local total harness native
+  local total harness native today_saved
   total=$(echo "$stream" | grep -c 'tool=' || true)
   harness=$(echo "$stream" | grep -c 'tool=.*saved=' || true)
   native=$((total - harness))
+  today_saved=$(echo "$stream" | grep -oP 'saved=\K[0-9]+' | awk '{s+=$1} END {print s+0}')
 
-  echo "──────────── summary ────────────"
-  printf "total tool calls:   %s\n" "$total"
-  printf "harness calls:      %s\n" "$harness"
-  printf "native calls:       %s\n" "$native"
+  echo "════════════════════════════════════════"
+  echo "  🛠  Harness tool calls"
+  echo "════════════════════════════════════════"
+  printf "  total tool calls:   %s\n" "$(fmt_num "$total")"
+  printf "  harness calls:      %s\n" "$(fmt_num "$harness")"
+  printf "  native calls:       %s\n" "$(fmt_num "$native")"
   echo
 
   if [[ $total -gt 0 ]]; then
-    echo "──────────── by tool ────────────"
-    echo "$stream" | grep -oP 'tool=\K[a-z_]+' | sort | uniq -c | sort -rn
+    echo "────────────────────────────────────────"
+    echo "  📊 by tool"
+    echo "────────────────────────────────────────"
+    echo "$stream" | grep -oP 'tool=\K[a-z_]+' | sort | uniq -c | sort -rn | \
+      awk '{ printf "  %5d  %s\n", $1, $2 }'
     echo
-    echo "──────────── last 10 calls ────────────"
-    echo "$stream" | grep 'tool=' | tail -10
+
+    echo "────────────────────────────────────────"
+    echo "  ⏱  last 5 calls"
+    echo "────────────────────────────────────────"
+    echo "$stream" | grep 'tool=' | tail -5 | sed 's/^/  /'
   fi
 
+  echo
+
   if [[ -f "$TOTALS" ]]; then
+    local cum_total cum_calls
+    cum_total=$(python3 -c "import json; print(json.load(open('$TOTALS'))['totalSaved'])" 2>/dev/null || echo 0)
+    cum_calls=$(python3 -c "import json; print(json.load(open('$TOTALS'))['calls'])" 2>/dev/null || echo 0)
+
+    echo "════════════════════════════════════════"
+    printf "  💰 TOTAL SAVED:  %s tokens\n" "$(fmt_num "$cum_total")"
+    printf "  📞 calls:        %s\n" "$(fmt_num "$cum_calls")"
+    echo "════════════════════════════════════════"
+  fi
+
+  if [[ "$today_saved" -gt 0 ]]; then
     echo
-    echo "──────────── running total ────────────"
-    cat "$TOTALS"
+    printf "  💵 today:        %s tokens\n" "$(fmt_num "$today_saved")"
   fi
 }
 
 case "${1:-}" in
-  --all)
-    summary "$(cat "$LOG")"
-    ;;
+  --all)   summary "$(cat "$LOG")" ;;
   --watch)
     while true; do
       clear
@@ -66,10 +83,6 @@ case "${1:-}" in
       sleep 3
     done
     ;;
-  --live)
-    tail -f "$LOG" | grep --line-buffered 'tool=\|plugin loaded'
-    ;;
-  *)
-    summary "$(filter_today)"
-    ;;
+  --live)  tail -f "$LOG" | grep --line-buffered 'tool=\|plugin loaded' ;;
+  *)       summary "$(filter_today)" ;;
 esac

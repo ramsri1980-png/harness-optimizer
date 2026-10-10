@@ -115,13 +115,13 @@ group), in this order:
 
 
 ## Token Metric Reporting
-When a harness tool returns a `[TOKEN METRIC]` line, echo it verbatim
-on its own line when the saved value exceeds 500 tokens. Suppress
-metric lines with saved < 500 to reduce conversation noise.
+Do NOT echo individual `[TOKEN METRIC]` lines during a task. They are
+recorded automatically by the token-metrics plugin.
 
-When the user asks for a summary, run:
-    ./scripts/tool-calls.sh --all
-and paste the result.
+At the END of a task, or whenever the user asks for a summary, run:
+    ./scripts/tool-calls.sh
+and paste the result once (it shows 💰 total saved). Do not run it
+mid-task unless asked.
 
 
 ## Context Pressure Protocol
