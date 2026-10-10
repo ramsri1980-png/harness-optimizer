@@ -113,12 +113,16 @@ group), in this order:
 - Do not silently skip a check because the tool is unavailable. Say so
   and ask how to proceed.
 
+
 ## Token Metric Reporting
-Routine `[TOKEN METRIC]` lines are recorded by the token-metrics plugin in
-`~/.config/opencode/.harness-token-metrics.log`. Do not echo them in normal
-assistant replies — keep them out of the conversation flow. Display a metric
-only when the user explicitly asks for it, and describe it as an estimated
-payload reduction (not measured end-to-end savings). Never fabricate numbers.
+When a harness tool returns a `[TOKEN METRIC]` line, echo it verbatim
+on its own line when the saved value exceeds 500 tokens. Suppress
+metric lines with saved < 500 to reduce conversation noise.
+
+When the user asks for a summary, run:
+    ./scripts/tool-calls.sh --all
+and paste the result.
+
 
 ## Context Pressure Protocol
 When context-watch warns you, STOP and produce a Context Checkpoint Report:
