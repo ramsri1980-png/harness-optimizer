@@ -12,6 +12,10 @@
 | execute_and_capture | Run whitelisted command | ★★ |
 | inspect_database_schema | SQLite table listing | ★ |
 
+## Subsets
+To reduce per-request token overhead, you can register only the tools you need.
+See [HARNESS-TOOLS-SUBSETS.md](HARNESS-TOOLS-SUBSETS.md) for recommended configurations and token savings.
+
 ## get_repo_skeleton
 Returns a bounded AST/ranked map of a repository.
 - mode="outline" (default): Python symbol outline with line ranges.

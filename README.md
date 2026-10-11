@@ -1,22 +1,35 @@
 # harness-optimizer
 
+Current: 0.18.0
+
 One-command installer for a token-optimized MCP tool suite that supercharges
 OpenCode with surgical code reading/editing, safe git checkpoints, and live
 token-savings metrics.
 
+## What's New
+- All 9 MCP tools
+- CTX auto-context plugin
+- Tool schema compression (~24% smaller)
+- Token description compression (67%)
+- Bash noise filtering (pytest/npm/docker/go/cargo)
+- Honest token metrics (log-derived counters)
+- Caveman-style terse output
+
 ## Install
 
-    npx harness-optimizer
+    npx harness-optimizer                 # core install (9 MCP tools + token metrics)
+    npx harness-optimizer --with-context  # install with CTX auto-context plugin
 
 Then restart OpenCode. Ask: `List your available tools.`
 
 ## Commands
 
-    npx harness-optimizer              # install or update
-    npx harness-optimizer --doctor     # health check (15 checks)
-    npx harness-optimizer --uninstall  # clean removal
-    npx harness-optimizer --force      # reset to defaults
-    npx harness-optimizer --help       # full usage
+    npx harness-optimizer                 # install or update
+    npx harness-optimizer --with-context  # install with auto-context (CTX) plugin
+    npx harness-optimizer --doctor        # health check (15 checks)
+    npx harness-optimizer --uninstall     # clean removal
+    npx harness-optimizer --force         # reset to defaults
+    npx harness-optimizer --help          # full usage
 
 ## What It Installs
 
@@ -61,6 +74,8 @@ After install, see ~/developer/harness-optimizer/docs/:
 - TOOLS.md
 - CONFIGURATION.md
 - TROUBLESHOOTING.md
+- [HARNESS-TOOLS-SUBSETS.md](docs/HARNESS-TOOLS-SUBSETS.md)
+- [POC-RESULTS.md](docs/POC-RESULTS.md)
 
 ## Security Model
 
@@ -112,7 +127,8 @@ need, save. Restart OpenCode.
 
 Use `HARNESS_TOOLS=none` to disable all tools, or a comma-separated list
 of specific tool names. Disabled tools are not registered with the MCP
-client — the model never sees them.
+client — the model never sees them. See [docs/HARNESS-TOOLS-SUBSETS.md](docs/HARNESS-TOOLS-SUBSETS.md)
+for recommended subsets and token impact.
 
 Restart OpenCode after changing this setting.
 
