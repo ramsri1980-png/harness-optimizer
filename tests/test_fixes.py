@@ -2748,6 +2748,24 @@ async def test_tool_docstring_size_reduced():
     check("DOCS-01: total docstring chars <= 1700",
           total_chars <= 1700, f"actual={total_chars}")
 
+async def test_schema_sizes_compressed():
+    print("\n[Test COMPRESS] MCP schema size reduction")
+    import json
+    tools = await server.mcp.list_tools()
+    total = 0
+    for t in tools:
+        s = json.dumps(t.parameters, separators=(',', ':'))
+        total += len(s)
+        props = t.parameters.get("properties", {})
+        for pname, spec in props.items():
+            check(f"COMPRESS: {t.name}.{pname} has no default",
+                  "default" not in spec, str(spec))
+        check(f"COMPRESS: {t.name} no additionalProperties",
+              "additionalProperties" not in t.parameters,
+              str(t.parameters)[:200])
+    check("COMPRESS: total schema chars <= 1450",
+          total <= 1450, f"total={total} chars")
+
 
 async def main():
     print("=" * 60)
@@ -2868,6 +2886,7 @@ async def main():
     await test_exec_ansi_and_cr_stripped()
     await test_exec_unknown_tool_unfiltered()
     await test_tool_docstring_size_reduced()
+    await test_schema_sizes_compressed()
 
     # REF tests (T03)
     await test_ref_text_contract_and_boundaries()

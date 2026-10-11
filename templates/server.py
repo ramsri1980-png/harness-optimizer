@@ -2199,5 +2199,61 @@ async def inspect_database_schema(db_path: str, tables: str = "") -> str:
         conn.close()
 
 
+def _compress_mcp_schemas():
+    """Strip redundant fields from FastMCP-emitted schemas.
+
+    FastMCP includes per-parameter `default` and `additionalProperties`
+    that bloat every request. The server applies defaults in Python
+    regardless, so dropping them is behaviorally transparent.
+    """
+    registry = None
+    for attr in ("_tool_manager", "_tools", "_tool_registry"):
+        candidate = getattr(mcp, attr, None)
+        if candidate is None:
+            continue
+        registry = getattr(candidate, "_tools", candidate) or None
+        if registry:
+            break
+    if not registry:
+        for attr in ("_local_provider", "providers"):
+            candidate = getattr(mcp, attr, None)
+            if candidate is None:
+                continue
+            providers = candidate if isinstance(candidate, (list, tuple)) else [candidate]
+            for p in providers:
+                comps = getattr(p, "_components", None)
+                if isinstance(comps, dict):
+                    registry = comps
+                    break
+                tools = getattr(p, "_tools", None)
+                if isinstance(tools, dict):
+                    registry = tools
+                    break
+            if registry:
+                break
+    if not registry:
+        return  # silently no-op
+
+    for name, tool in registry.items():
+        try:
+            params = getattr(tool, "parameters", None)
+            if not isinstance(params, dict):
+                continue
+            props = params.get("properties")
+            if isinstance(props, dict):
+                for pname, spec in props.items():
+                    if not isinstance(spec, dict):
+                        continue
+                    spec.pop("default", None)
+                    spec.pop("title", None)
+            params.pop("additionalProperties", None)
+        except Exception:
+            continue
+
+
+_compress_mcp_schemas()
+
+
 if __name__ == "__main__":
     mcp.run(transport="stdio")
+
