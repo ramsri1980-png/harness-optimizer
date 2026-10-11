@@ -148,6 +148,121 @@ export function formatTotals(totals) {
   return `estimate: ${estSaved} saved / ${estCalls} calls; provider: ${provSaved} / ${provCalls}; legacy: ${hasLegacy ? "yes" : "no"}`;
 }
 
+// ─────────────────────────────────────────────────────────────
+// MET Day 2 — provider-reported usage normalization (pure)
+// ─────────────────────────────────────────────────────────────
+
+const INPUT_KEYS = ["inputTokens", "input", "promptTokens", "prompt"]
+const OUTPUT_KEYS = ["outputTokens", "output", "completionTokens", "completion"]
+// Cache reads and reasoning are SUBSETS of input/output on every adapter
+// that documents them (Anthropic: cache_read_input_tokens sits inside
+// input_tokens; OpenAI: completion_tokens_details.reasoning_tokens sits
+// inside completion_tokens). They are read for coverage, never added.
+const CACHED_KEYS = ["cachedInputTokens", "cached", "cacheRead", "cache_read"]
+const REASONING_KEYS = ["reasoningTokens", "reasoning"]
+
+function firstNumber(record, keys) {
+  if (!record || typeof record !== "object") return undefined
+  for (const key of keys) {
+    const value = record[key]
+    if (typeof value === "number" && Number.isFinite(value)) return value
+    if (typeof value === "string" && value.trim() !== "" && Number.isFinite(Number(value))) {
+      return Number(value)
+    }
+  }
+  return undefined
+}
+
+/**
+ * Normalizes one provider-reported usage record.
+ *
+ * record = { id, sessionID?, inputTokens, outputTokens, cachedInputTokens?,
+ *            reasoningTokens?, providerID?, modelID?, status? } — the flat
+ * aliases every adapter uses ({input, cached|cache_read, output, reasoning})
+ * are accepted too.
+ *
+ * Returns { normalized: {input, output, total}, coverage } where coverage is
+ *   "complete" — input and output both reported (0 is a real report)
+ *   "partial"  — some field reported, at least one of input/output missing
+ *   "unknown"  — no recognized field at all
+ *
+ * Never sums every numeric field: cached/reasoning are subsets that the
+ * adapter already folded into input/output, so adding them would double
+ * count (MET-01: 1000+200 stays 1200, not 1650). `status` is ignored, so a
+ * failed attempt that still reports usage counts like any other record
+ * (MET-03). Fail open: a malformed record yields "unknown", never a throw.
+ */
+export function classifyProviderUsage(record) {
+  try {
+    const input = firstNumber(record, INPUT_KEYS)
+    const output = firstNumber(record, OUTPUT_KEYS)
+    const cached = firstNumber(record, CACHED_KEYS)
+    const reasoning = firstNumber(record, REASONING_KEYS)
+
+    const reported = [input, output, cached, reasoning].some((v) => v !== undefined)
+    if (!reported) {
+      return { normalized: { input: 0, output: 0, total: 0 }, coverage: "unknown" }
+    }
+
+    const inTokens = input ?? 0
+    const outTokens = output ?? 0
+    const coverage = input === undefined || output === undefined ? "partial" : "complete"
+    return {
+      normalized: { input: inTokens, output: outTokens, total: inTokens + outTokens },
+      coverage,
+    }
+  } catch {
+    return { normalized: { input: 0, output: 0, total: 0 }, coverage: "unknown" }
+  }
+}
+
+/**
+ * Folds one usage record into a running aggregate, deduplicating on
+ * (sessionID, id): the same id in two sessions is two records, the same id
+ * in the same session is a replay and counts once (MET-04).
+ *
+ * Records with coverage "unknown" contribute nothing. State carries a
+ * non-enumerable `_seen` Map (same convention as classifyTotals) so a JSON
+ * round trip degrades to "no dedup memory" instead of corrupting totals.
+ * Fail open: any error returns the previous totals.
+ */
+export function accumulateProviderUsage(prev, record) {
+  try {
+    const totals = {
+      input: Number(prev?.input) || 0,
+      output: Number(prev?.output) || 0,
+      total: Number(prev?.total) || 0,
+      calls: Number(prev?.calls) || 0,
+    }
+    const seen = prev && prev._seen instanceof Map ? prev._seen : new Map()
+    Object.defineProperty(totals, "_seen", {
+      value: seen,
+      writable: true,
+      enumerable: false,
+      configurable: true,
+    })
+
+    const classified = classifyProviderUsage(record)
+    if (classified.coverage === "unknown") return totals
+
+    const id = record?.id
+    if (id) {
+      const session = record.sessionID ?? record.sessionId ?? ""
+      const key = JSON.stringify([session, id])
+      if (seen.has(key)) return totals
+      seen.set(key, true)
+    }
+
+    totals.input += classified.normalized.input
+    totals.output += classified.normalized.output
+    totals.total += classified.normalized.total
+    totals.calls += 1
+    return totals
+  } catch {
+    return prev
+  }
+}
+
 export function extractLogLine(metricText, timestamp, runTotal) {
   let tool = "";
   let saved = 0;
@@ -259,6 +374,83 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         throw new Error(`Expected calls 1 fresh from log, got ${rebuilt.estimate.calls}`);
       }
       console.log("[PASS] MET-09: legacy totals preserved and estimate rebuilt from log");
+    },
+    "met-01": () => {
+      const payloads = [
+        { id: "p1", input: 1000, cached: 400, output: 200, reasoning: 50 },
+        { id: "p2", input: 1000, cache_read: 400, output: 200, reasoning: 50 },
+      ];
+      for (const payload of payloads) {
+        const usage = classifyProviderUsage(payload);
+        if (usage.coverage !== "complete") {
+          throw new Error(`Expected coverage complete for ${payload.id}, got ${usage.coverage}`);
+        }
+        if (usage.normalized.total !== 1200) {
+          throw new Error(`Expected total 1200 for ${payload.id}, got ${usage.normalized.total}`);
+        }
+        if (usage.normalized.input !== 1000 || usage.normalized.output !== 200) {
+          throw new Error(
+            `Expected input 1000 / output 200 for ${payload.id}, got ${JSON.stringify(usage.normalized)}`
+          );
+        }
+      }
+      console.log("[PASS] MET-01: cache/reasoning subsets count once (1200, never 1650)");
+    },
+    "met-03": () => {
+      const missing = classifyProviderUsage({ id: "no-usage" });
+      if (missing.coverage !== "unknown" || missing.normalized.total !== 0) {
+        throw new Error(`Expected unknown/0 without usage fields, got ${JSON.stringify(missing)}`);
+      }
+      const zero = classifyProviderUsage({ id: "zero", inputTokens: 0, outputTokens: 0 });
+      if (zero.coverage !== "complete" || zero.normalized.total !== 0) {
+        throw new Error(`Expected complete/0 for reported zeros, got ${JSON.stringify(zero)}`);
+      }
+      const failedRecord = {
+        id: "boom",
+        status: "error",
+        sessionID: "s1",
+        inputTokens: 1500,
+        outputTokens: 500,
+      };
+      const failed = classifyProviderUsage(failedRecord);
+      if (failed.coverage !== "complete" || failed.normalized.total !== 2000) {
+        throw new Error(`Failed attempt must normalize like any record, got ${JSON.stringify(failed)}`);
+      }
+      let acc = accumulateProviderUsage(null, failedRecord);
+      acc = accumulateProviderUsage(acc, { id: "no-usage", sessionID: "s1" });
+      if (acc.total !== 2000 || acc.calls !== 1) {
+        throw new Error(`Expected failed attempt counted once (2000/1), got ${acc.total}/${acc.calls}`);
+      }
+      console.log("[PASS] MET-03: missing=unknown, zero=complete, failed attempt counted (2000, 1 call)");
+    },
+    "met-04": () => {
+      let acc = accumulateProviderUsage(null, {
+        id: "call-1",
+        sessionID: "s1",
+        inputTokens: 100,
+        outputTokens: 50,
+      });
+      acc = accumulateProviderUsage(acc, {
+        id: "call-1",
+        sessionID: "s2",
+        inputTokens: 100,
+        outputTokens: 50,
+      });
+      if (acc.total !== 300 || acc.calls !== 2) {
+        throw new Error(`Same id in two sessions must both count, got ${acc.total}/${acc.calls}`);
+      }
+      acc = accumulateProviderUsage(acc, {
+        id: "call-1",
+        sessionID: "s1",
+        inputTokens: 100,
+        outputTokens: 50,
+      });
+      if (acc.total !== 300 || acc.calls !== 2) {
+        throw new Error(`Same id + same session must dedupe once, got ${acc.total}/${acc.calls}`);
+      }
+      console.log(
+        "[PASS] MET-04: scope isolation — different session counts, same session dedupes (300, 2 calls)"
+      );
     },
     "met-11": () => {
       // Pure helpers must not import fs, os, child_process

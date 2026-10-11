@@ -1,5 +1,5 @@
 """
-tests/test_met.py — MET Day 1 test suite (MET-02, 07, 09, 11, 13, 14, 15).
+tests/test_met.py — MET test suite (MET-01, 02, 03, 04, 07, 09, 11, 13, 14, 15).
 Run directly: python3 tests/test_met.py
 """
 import datetime
@@ -240,8 +240,56 @@ def test_tool_calls_session_flag():
         )
 
 
+def test_subsets_not_added_twice():
+    # MET-01
+    r = subprocess.run(
+        ["node", str(HELPERS_MJS), "--selftest", "met-01"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    ok = r.returncode == 0 and "PASS" in r.stdout and "1200" in r.stdout
+    check(
+        "MET-01: cache/reasoning subsets normalize to 1200, never 1650",
+        ok,
+        r.stdout + r.stderr,
+    )
+
+
+def test_missing_zero_failed_usage():
+    # MET-03
+    r = subprocess.run(
+        ["node", str(HELPERS_MJS), "--selftest", "met-03"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    ok = r.returncode == 0 and "PASS" in r.stdout
+    check(
+        "MET-03: missing=unknown, reported zero=complete, failed attempt counted",
+        ok,
+        r.stdout + r.stderr,
+    )
+
+
+def test_provider_scope_isolation():
+    # MET-04
+    r = subprocess.run(
+        ["node", str(HELPERS_MJS), "--selftest", "met-04"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    ok = r.returncode == 0 and "PASS" in r.stdout
+    check(
+        "MET-04: same id across sessions counts; same id + session dedupes",
+        ok,
+        r.stdout + r.stderr,
+    )
+
+
 def main():
-    print("Running MET Day 1 Test Suite...")
+    print("Running MET Test Suite...")
     test_stream_replay_and_real_retries()
     test_no_fabricated_credit()
     test_legacy_totals_preserved()
@@ -249,6 +297,9 @@ def main():
     test_tool_calls_default_view()
     test_tool_calls_today_flag()
     test_tool_calls_session_flag()
+    test_subsets_not_added_twice()
+    test_missing_zero_failed_usage()
+    test_provider_scope_isolation()
 
     print("=" * 60)
     passed = sum(1 for _, ok in results if ok)

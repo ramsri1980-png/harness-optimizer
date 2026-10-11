@@ -14,6 +14,34 @@ const CONFIG_DIR = join(homedir(), ".config", "opencode")
 const TOTALS_PATH = join(CONFIG_DIR, ".harness-token-totals.json")
 const LOG_PATH = join(CONFIG_DIR, ".harness-token-metrics.log")
 
+// ── Provider-reported usage (MET Day 2) ─────────────────────────────────
+// Survey of the installed plugin SDK (~/.config/opencode/node_modules.bak/
+// @opencode/plugin, 0.0.0-beta-19507, bundled with opencode v2.0.24):
+//
+//   ctx.session.hook — prompt, context, compaction, generate, title,
+//                      model.request, http.request, http.response, retry
+//   ctx.tool.hook    — execute.before, execute.after
+//   ctx.aisdk.hook   — sdk, language
+//
+// NO hook payload carries provider-reported token usage:
+//   - SessionContext/SessionPrompt/SessionModelRequest have no usage field.
+//   - TokenUsage.Info ({input, output, reasoning, cache}) appears only on
+//     SessionCompactionResult.tokens, which is plugin *output* a compaction
+//     may set — not usage reported back to us.
+//   - The event stream does carry `session.usage.updated` /
+//     `session.usage.recorded`, but they are session-level aggregates with
+//     no providerID/modelID, no per-call identity, and no documented
+//     delta-vs-total semantics; feeding them into per-call totals would
+//     risk the exact double counting MET-01 forbids.
+//
+// So NO observer is registered here: provider tracking stays "unknown"
+// (provider: 0 / 0) until the SDK exposes a per-call usage hook. Do not
+// invent one. When it lands, normalize each record with
+// classifyProviderUsage() / accumulateProviderUsage() from
+// ./token-metrics-helpers.mjs — they already handle subset fields,
+// missing-vs-zero-vs-failed and (sessionID, id) scope isolation.
+// ────────────────────────────────────────────────────────────────────────
+
 function extractToolText(event: any): string {
   const parts: string[] = []
   const push = (v: any) => { if (typeof v === "string" && v) parts.push(v) }

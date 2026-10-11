@@ -12,6 +12,11 @@ Run directly::
 Deliberately NOT wired into ``tests/test_fixes.py``: it spawns OpenCode plus a
 local stub provider and would slow the main suite.
 
+CTX-API-10/CTX-API-11 (dedup + errored-input purge) run *before* the stub
+gate: they drive the plugin's real ``context`` hook with a synthetic message
+array inside a throwaway ``opencode run``, so they execute even when the
+stub provider — and therefore the end-to-end section below — is absent.
+
 Reuses the CTX spike's local OpenAI-compatible stub provider
 (``/tmp/opencode/ctx_spike/stub_provider.py``). That stub appends every raw
 request body it receives to ``/tmp/opencode/ctx_spike/request.jsonl``; this
@@ -721,7 +726,284 @@ def _check_ctx06(env, workspace, plugin_dir):
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# CTX-API-10 / CTX-API-11 — hook-level checks (no stub provider needed)
+#
+# These drive the REAL `context` hook of templates/auto-context.ts with a
+# synthetic message array: a throwaway OpenCode run loads a probe plugin
+# that imports the plugin under test, captures the hook it registers, and
+# fires it. The probe writes its result during plugin `setup`, i.e. before
+# the model request, so the run is pointed at an unavailable model ref to
+# stay off the network — only the plugin load matters here.
+# ─────────────────────────────────────────────────────────────────────────
+
+PROBE_TIMEOUT = 120
+
+PROBE_TS = r'''
+import { writeFileSync } from "fs"
+import autoContext from "../lib/auto-context.ts"
+
+const OUT = "__OUT__"
+const results: any = {}
+
+function parts(message: any): any[] {
+  if (Array.isArray(message?.content)) return message.content
+  if (Array.isArray(message?.parts)) return message.parts
+  return []
+}
+function countType(messages: any[], type: string): number {
+  let n = 0
+  for (const message of messages) {
+    for (const part of parts(message)) {
+      if (part && part.type === type) n++
+    }
+  }
+  return n
+}
+function firstOf(messages: any[], type: string): any {
+  for (const message of messages) {
+    for (const part of parts(message)) {
+      if (part && part.type === type) return part
+    }
+  }
+  return null
+}
+function findInput(messages: any[], id: string): any {
+  for (const message of messages) {
+    for (const part of parts(message)) {
+      if (part && part.type === "tool-call" && part.id === id) return part.input
+    }
+  }
+  return undefined
+}
+function visibleText(messages: any[]): string {
+  let out = ""
+  for (const message of messages) {
+    for (const part of parts(message)) {
+      if (part && part.type === "text" && typeof part.text === "string") out += part.text + "\n"
+      if (part && part.result && typeof part.result.value === "string") out += part.result.value + "\n"
+    }
+  }
+  return out
+}
+
+export default {
+  id: "ctx-hook-probe",
+  async setup(_ctx: any) {
+    try {
+      let hook: any = null
+      await autoContext.setup({
+        location: { directory: process.cwd() },
+        session: {
+          hook: async (_name: string, callback: any) => {
+            hook = callback
+            return { dispose: async () => {} }
+          },
+        },
+      } as any)
+      results.registered = typeof hook === "function"
+      if (typeof hook !== "function") throw new Error("context hook was not registered")
+
+      const base = {
+        agent: "primary",
+        model: "stub/stub-1",
+        system: [],
+        options: {},
+        tools: {},
+      }
+
+      // CTX-API-10: the same harness-tools call twice → one pair survives.
+      const duplicate: any[] = [
+        { id: "u1", role: "user", content: [{ type: "text", text: "Please look at ctx_fixtures/hello.txt and tell me what it says." }] },
+        { role: "assistant", content: [
+            { type: "text", text: "reading" },
+            { type: "tool-call", id: "c1", name: "harness-tools_rip_file_lines", input: { path: "ctx_fixtures/hello.txt", start_line: 1, end_line: 5 } },
+          ] },
+        { role: "tool", content: [{ type: "tool-result", id: "c1", name: "harness-tools_rip_file_lines", result: { type: "text", value: "1: Hello from the CTX fixture." } }] },
+        { role: "assistant", content: [
+            { type: "tool-call", id: "c2", name: "harness-tools_rip_file_lines", input: { path: "ctx_fixtures/hello.txt", start_line: 1, end_line: 5 } },
+          ] },
+        { role: "tool", content: [{ type: "tool-result", id: "c2", name: "harness-tools_rip_file_lines", result: { type: "text", value: "1: Hello from the CTX fixture." } }] },
+      ]
+      await hook({ ...base, messages: duplicate })
+      const survivor = firstOf(duplicate, "tool-result")
+      results.dedupe = {
+        toolCalls: countType(duplicate, "tool-call"),
+        toolResults: countType(duplicate, "tool-result"),
+        survivorId: survivor ? survivor.id : null,
+        assistantTextKept: visibleText(duplicate).includes("reading"),
+        messages: duplicate.length,
+      }
+
+      // CTX-API-11: 5 KB input on an errored call → purged, error kept,
+      // and the healthy call beside it untouched.
+      const purge: any[] = [
+        { id: "u2", role: "user", content: [{ type: "text", text: "do the thing" }] },
+        { role: "assistant", content: [{ type: "tool-call", id: "e1", name: "harness-tools_apply_search_replace", input: { path: "ctx_fixtures/hello.txt", search_block: "x".repeat(5000) } }] },
+        { role: "tool", content: [{ type: "tool-result", id: "e1", name: "harness-tools_apply_search_replace", result: { type: "error", value: "ERROR: TARGET SEARCH BLOCK NOT FOUND EXACTLY" } }] },
+        { role: "assistant", content: [{ type: "tool-call", id: "k1", name: "harness-tools_rip_file_lines", input: { path: "ctx_fixtures/hello.txt", start_line: 1, end_line: 2 } }] },
+        { role: "tool", content: [{ type: "tool-result", id: "k1", name: "harness-tools_rip_file_lines", result: { type: "text", value: "1: ok" } }] },
+      ]
+      await hook({ ...base, messages: purge })
+      const erroredInput = findInput(purge, "e1")
+      results.purge = {
+        erroredInput: typeof erroredInput === "string"
+          ? erroredInput
+          : (erroredInput === undefined ? undefined : JSON.stringify(erroredInput)),
+        intactInput: findInput(purge, "k1"),
+        errorKept: visibleText(purge).includes("TARGET SEARCH BLOCK NOT FOUND"),
+        toolResults: countType(purge, "tool-result"),
+      }
+    } catch (err: any) {
+      results.error = String(err && err.stack ? err.stack : err)
+    }
+    try {
+      writeFileSync(OUT, JSON.stringify(results, null, 2))
+    } catch {}
+  },
+}
+'''
+
+
+def _run_hook_probe():
+    """Run the probe plugin and return its JSON result (None if unavailable)."""
+    if not shutil.which("opencode"):
+        print("SKIP: opencode not on PATH — hook-level checks skipped")
+        return None
+
+    tmp = tempfile.mkdtemp(prefix="ctx-hook-probe-")
+    try:
+        config_dir = os.path.join(tmp, "config")
+        plugins_dir = os.path.join(config_dir, "plugins")
+        lib_dir = os.path.join(config_dir, "lib")
+        workspace = os.path.join(tmp, "workspace")
+        result_path = os.path.join(tmp, "probe-result.json")
+        for directory in (plugins_dir, lib_dir, workspace):
+            os.makedirs(directory)
+
+        shutil.copyfile(PLUGIN, os.path.join(lib_dir, "auto-context.ts"))
+        with open(os.path.join(plugins_dir, "probe.ts"), "w", encoding="utf-8") as fh:
+            fh.write(PROBE_TS.replace("__OUT__", result_path))
+
+        config = {
+            "$schema": "https://opencode.ai/config.json",
+            "providers": {
+                "stub": {
+                    "package": "@opencode/ai/providers/openai-compatible",
+                    "settings": {"baseURL": "http://127.0.0.1:8123/v1"},
+                    "models": {"stub-1": {"name": "Stub"}},
+                }
+            },
+            "agents": {"primary": {"model": "missing/model"}},
+            "plugins": [plugins_dir],
+        }
+        with open(os.path.join(config_dir, "opencode.json"), "w", encoding="utf-8") as fh:
+            json.dump(config, fh, indent=2)
+
+        env = {
+            "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+            "HOME": os.path.join(tmp, "home"),
+            "OPENCODE_CONFIG_DIR": config_dir,
+            "OPENCODE_TEST_HOME": os.path.join(tmp, "testhome"),
+            "OPENCODE_DISABLE_MODELS_FETCH": "1",
+            "HARNESS_CTX": "on",
+        }
+        os.makedirs(env["HOME"], exist_ok=True)
+
+        proc = subprocess.run(
+            # `missing/model` fails AFTER plugin setup, which is exactly when
+            # the probe writes its result — no provider, no network, no stall.
+            ["opencode", "run", "--standalone", "--auto", "-m", "missing/model", "hook probe"],
+            cwd=workspace,
+            env=env,
+            capture_output=True,
+            timeout=PROBE_TIMEOUT,
+        )
+        print("[opencode] hook-probe run exit=%s" % proc.returncode)
+        if not os.path.isfile(result_path):
+            sys.stdout.write(
+                "[probe] no result file — stdout:\n%s\nstderr:\n%s\n"
+                % (
+                    proc.stdout.decode("utf-8", "replace")[:1500],
+                    proc.stderr.decode("utf-8", "replace")[:1500],
+                )
+            )
+            return {"error": "probe wrote no result"}
+        with open(result_path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except subprocess.TimeoutExpired:
+        return {"error": "hook probe exceeded %ds" % PROBE_TIMEOUT}
+    except Exception as exc:  # fail open: reported as a failed check below
+        return {"error": str(exc)}
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _check_api10(probe):
+    """CTX-API-10: two identical harness tool calls collapse into one pair."""
+    dedupe = (probe or {}).get("dedupe") or {}
+    ok = (
+        probe is not None
+        and probe.get("registered") is True
+        and probe.get("error") is None
+        and dedupe.get("toolCalls") == 1
+        and dedupe.get("toolResults") == 1
+        and dedupe.get("survivorId") == "c2"
+        and dedupe.get("assistantTextKept") is True
+    )
+    return _check(
+        "CTX-API-10: duplicate harness-tools calls dedup to one (later one kept)",
+        ok,
+        "registered=%s calls=%s results=%s survivor=%s text_kept=%s error=%s"
+        % (
+            (probe or {}).get("registered"),
+            dedupe.get("toolCalls"),
+            dedupe.get("toolResults"),
+            dedupe.get("survivorId"),
+            dedupe.get("assistantTextKept"),
+            (probe or {}).get("error"),
+        ),
+    )
+
+
+def _check_api11(probe):
+    """CTX-API-11: the 5 KB input on an errored call is replaced."""
+    purge = (probe or {}).get("purge") or {}
+    errored_input = purge.get("erroredInput")
+    intact = purge.get("intactInput")
+    ok = (
+        probe is not None
+        and probe.get("error") is None
+        and isinstance(errored_input, str)
+        and errored_input.startswith("<purged:")
+        and purge.get("errorKept") is True
+        and purge.get("toolResults") == 2
+        and isinstance(intact, dict)
+        and intact.get("start_line") == 1
+    )
+    return _check(
+        "CTX-API-11: oversized input on an errored call is purged, error kept",
+        ok,
+        "errored_input=%r error_kept=%s results=%s intact=%r error=%s"
+        % (
+            errored_input,
+            purge.get("errorKept"),
+            purge.get("toolResults"),
+            intact,
+            (probe or {}).get("error"),
+        ),
+    )
+
+
 def main():
+    # Hook-level checks first: they need no stub provider, so they still run
+    # when the end-to-end section below skips.
+    probe = _run_hook_probe()
+    probe_ok = True
+    if probe is not None:
+        probe_ok = _check_api10(probe)
+        probe_ok = _check_api11(probe) and probe_ok
+
     for label, path in (
         ("stub provider", STUB_PATH),
         ("plugin", PLUGIN),
@@ -734,7 +1016,7 @@ def main():
         if not os.path.exists(path):
             if label == "stub provider":
                 print("SKIP: %s not present at %s — CTX smoke test skipped." % (label, path))
-                return 0
+                return 0 if probe_ok else 1
             print("FAIL: %s not found at %s" % (label, path))
             return 1
 
@@ -870,6 +1152,7 @@ def main():
         print("\n[stub] captured %d request body/bodies from %s" % (len(bodies), STUB_OUT))
 
         ok = _run_assertions(bodies, raw)
+        ok = probe_ok and ok
 
         # CTX Day 2 checks, reusing the same stub and the same captured run.
         ok &= _check_api01(bodies)

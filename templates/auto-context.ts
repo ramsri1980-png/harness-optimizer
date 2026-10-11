@@ -568,6 +568,221 @@ export function decideGate(event: any, root?: string): {
   return { decision: "FOCUSED", token, reason: "packet-missing-or-stale" }
 }
 
+// --- CTX dedup + errored-input purge ----------------------------------------
+// Both helpers run at the very START of the context hook, before the gate,
+// mutate `messages` in place, and fail open: any error returns 0 and leaves
+// the request untouched.
+
+const HARNESS_TOOL_PREFIX = "harness-tools_"
+/** Inputs longer than this many characters are dropped from errored calls. */
+const PURGE_INPUT_CHARS = 2000
+
+/** The content (or parts) array of a wire message; null when unknown. */
+function messageParts(message: any): any[] | null {
+  if (Array.isArray(message?.content)) return message.content
+  if (Array.isArray(message?.parts)) return message.parts
+  return null
+}
+
+/** Canonical string for a tool-call input (stable enough to compare calls). */
+function canonicalArgs(input: any): string {
+  try {
+    if (typeof input === "string") return input
+    const json = JSON.stringify(input)
+    return json === undefined ? String(input) : json
+  } catch {
+    return String(input)
+  }
+}
+
+/** sha256 of a tool-call input, falling back to the raw text (fail open). */
+function argsHash(input: any): string {
+  const canonical = canonicalArgs(input)
+  try {
+    return createHash("sha256").update(canonical, "utf8").digest("hex")
+  } catch {
+    return canonical
+  }
+}
+
+/** True when a tool result reports failure (several shapes, one meaning). */
+function isErroredResult(part: any): boolean {
+  try {
+    const result = part?.result
+    if (result && typeof result === "object" && result.type === "error") return true
+    if (part?.status === "error") return true
+    if (part?.state && part.state.status === "error") return true
+    return false
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Drops the EARLIER of two identical `harness-tools_*` tool calls: the same
+ * (toolName, argsHash) appearing again at a later position keeps only that
+ * later pair. The orphaned tool-call part goes with its tool-result, so no
+ * provider ever sees a call without its result.
+ * Returns the number of duplicates removed, or 0 on error.
+ */
+export function dedupeToolResults(messages: any[]): number {
+  try {
+    if (!Array.isArray(messages)) return 0
+
+    const calls = new Map<string, { mi: number; pi: number; input: any }>()
+    const results: Array<{ mi: number; pi: number; name: string; id: string }> = []
+
+    for (let mi = 0; mi < messages.length; mi++) {
+      const parts = messageParts(messages[mi])
+      if (!parts) continue
+      for (let pi = 0; pi < parts.length; pi++) {
+        const part = parts[pi]
+        if (!part || typeof part !== "object") continue
+        if (part.type === "tool-call" && typeof part.id === "string") {
+          calls.set(part.id, { mi, pi, input: part.input })
+        } else if (part.type === "tool-result" && typeof part.id === "string") {
+          results.push({ mi, pi, name: String(part.name ?? ""), id: part.id })
+        }
+      }
+    }
+
+    const seen = new Set<string>()
+    const dropped = new Set<string>()
+    const dropParts: Array<{ mi: number; pi: number }> = []
+    const drop = (mi: number, pi: number) => {
+      const key = `${mi}:${pi}`
+      if (dropped.has(key)) return
+      dropped.add(key)
+      dropParts.push({ mi, pi })
+    }
+
+    // Newest → oldest: the first key met here is its LAST occurrence, which
+    // survives; every earlier twin of that key is dropped.
+    for (let i = results.length - 1; i >= 0; i--) {
+      const result = results[i]
+      if (!result.name.startsWith(HARNESS_TOOL_PREFIX)) continue
+      const call = calls.get(result.id)
+      if (!call) continue // fail open: without the input there is no hash
+      const key = JSON.stringify([result.name, argsHash(call.input)])
+      if (seen.has(key)) {
+        drop(result.mi, result.pi)
+        drop(call.mi, call.pi)
+      } else {
+        seen.add(key)
+      }
+    }
+
+    if (dropParts.length === 0) return 0
+
+    const byMessage = new Map<number, number[]>()
+    for (const target of dropParts) {
+      const list = byMessage.get(target.mi)
+      if (list) list.push(target.pi)
+      else byMessage.set(target.mi, [target.pi])
+    }
+
+    let removed = 0
+    // Descending message order and descending part order inside each, so
+    // every index still points at its original part while we splice.
+    for (const mi of [...byMessage.keys()].sort((a, b) => b - a)) {
+      const parts = messageParts(messages[mi])
+      if (!parts) continue
+      for (const pi of (byMessage.get(mi) || []).sort((a, b) => b - a)) {
+        if (pi >= parts.length) continue
+        parts.splice(pi, 1)
+        removed++
+      }
+      if (parts.length === 0) messages.splice(mi, 1)
+    }
+    return removed
+  } catch {
+    return 0
+  }
+}
+
+/**
+ * Shrinks the `input` of a tool call whose result reports an error: the
+ * failure text is what matters, the 5 KB payload behind it is not worth
+ * carrying. Inputs at or under the threshold are left untouched.
+ * Returns the number of purges, or 0 on error.
+ */
+export function purgeErroredInputs(messages: any[]): number {
+  try {
+    if (!Array.isArray(messages)) return 0
+
+    const calls = new Map<string, { mi: number; pi: number }>()
+    const errors: Array<{ mi: number; pi: number; id: string | null }> = []
+
+    for (let mi = 0; mi < messages.length; mi++) {
+      const parts = messageParts(messages[mi])
+      if (!parts) continue
+      for (let pi = 0; pi < parts.length; pi++) {
+        const part = parts[pi]
+        if (!part || typeof part !== "object") continue
+        if (part.type === "tool-call" && typeof part.id === "string") {
+          calls.set(part.id, { mi, pi })
+          continue
+        }
+        if (isErroredResult(part)) {
+          errors.push({ mi, pi, id: typeof part.id === "string" ? part.id : null })
+        }
+      }
+    }
+
+    let purged = 0
+    const done = new Set<string>()
+    for (const error of errors) {
+      // The input either sits on the failing part itself, or on the
+      // tool-call that produced it (paired by id).
+      const ownParts = messageParts(messages[error.mi])
+      const own = ownParts ? ownParts[error.pi] : null
+      const hasOwnInput = Boolean(
+        own && (own.input !== undefined || (own.state && own.state.input !== undefined))
+      )
+      const holder = hasOwnInput
+        ? { mi: error.mi, pi: error.pi }
+        : error.id
+          ? calls.get(error.id)
+          : undefined
+      if (!holder) continue
+
+      const key = `${holder.mi}:${holder.pi}`
+      if (done.has(key)) continue
+
+      const targetParts = messageParts(messages[holder.mi])
+      const target = targetParts ? targetParts[holder.pi] : null
+      if (!target) continue
+      const input = hasOwnInput
+        ? target.input !== undefined
+          ? target.input
+          : target.state?.input
+        : target.input
+      if (input === undefined) continue
+
+      let serialized: string
+      try {
+        const json = typeof input === "string" ? input : JSON.stringify(input)
+        serialized = json === undefined ? String(input) : json
+      } catch {
+        continue
+      }
+      if (serialized.length <= PURGE_INPUT_CHARS) continue
+
+      const replacement = `<purged: ${serialized.length} chars — see error>`
+      if (hasOwnInput && target.input !== undefined) target.input = replacement
+      else if (hasOwnInput && target.state) target.state.input = replacement
+      else target.input = replacement
+      done.add(key)
+      purged++
+    }
+    return purged
+  } catch {
+    return 0
+  }
+}
+
+// --- end dedup + purge ------------------------------------------------------
+
 export default {
   id: "harness.auto-context",
   async setup(ctx: any) {
@@ -578,6 +793,11 @@ export default {
         if (process.env.HARNESS_CTX === "off") return
         const messages = event?.messages
         if (!Array.isArray(messages)) return
+
+        // Hygiene before the gate: collapse repeated harness tool calls and
+        // shrink oversized inputs on errored ones. Both fail open.
+        dedupeToolResults(messages)
+        purgeErroredInputs(messages)
 
         let root = ""
         try {
