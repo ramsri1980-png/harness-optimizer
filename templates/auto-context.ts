@@ -529,6 +529,28 @@ function existingPacketDigests(messages: any[]): Array<{ source: string; sha256:
 }
 
 /**
+ * HARNESS_LEAN=1: a ranked-map packet already present in this request's
+ * messages and younger than HARNESS_CTX_MAP_TTL_S (default 600) is reused
+ * instead of being rebuilt and re-spliced. Safe by construction: it only
+ * fires when the packet is in `messages` right now, so the model keeps its
+ * map; if packets do not persist between requests this never matches and
+ * behaviour is unchanged. Packet ids are "ctx_" + Date.now().toString(36).
+ */
+function mapPacketFresh(messages: any[]): boolean {
+  if (process.env.HARNESS_LEAN !== "1") return false
+  const ttlMs = (Number(process.env.HARNESS_CTX_MAP_TTL_S) || 600) * 1000
+  for (const message of messages) {
+    if (message?.metadata?.harness_auto_context !== true) continue
+    if (!textOf(message).includes("# source: <ranked-map>")) continue
+    const m = /^ctx_([0-9a-z]+)$/.exec(String(message?.id ?? ""))
+    if (!m) continue
+    const born = parseInt(m[1], 36)
+    if (Number.isFinite(born) && Date.now() - born < ttlMs) return true
+  }
+  return false
+}
+
+/**
  * Day 2 gate: decides WHETHER to inject (see ctx-day2 brief, Phase 2).
  * Rules are checked in order; every error path fails open as NONE/FOCUSED.
  */
@@ -550,7 +572,10 @@ export function decideGate(event: any, root?: string): {
 
   const token = extractPath(target.text)
   if (!token) {
-    if (looksLikeRepoQuestion(target.text)) return { decision: "MAP", token: null, reason: "map-signal" }
+    if (looksLikeRepoQuestion(target.text)) {
+      if (mapPacketFresh(messages)) return { decision: "REUSE", token: null, reason: "map-packet-fresh" }
+      return { decision: "MAP", token: null, reason: "map-signal" }
+    }
     return { decision: "NONE", token: null, reason: "no-path-token" }
   }
 
@@ -819,7 +844,7 @@ export default {
         if (gate.decision === "MAP") {
           try {
             const mapReply = await callWorker(
-              { cmd: "map", root, max_tokens: 1500 },
+              { cmd: "map", root, max_tokens: Number(process.env.HARNESS_CTX_MAP_TOKENS) || 1500 },
               30000,
             )
             if (!mapReply || !mapReply.ok || typeof mapReply.text !== "string"

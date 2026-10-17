@@ -325,7 +325,7 @@ asyncio.run(main())
       check("opencode.json parses", false, e.message);
     }
   }
-  for (const cmd of ["harness-plan.md", "harness-config.md", "harness-rollback-confirm.md", "harness-help.md"]) {
+  for (const cmd of ["harness-plan.md", "harness-config.md", "harness-rollback-confirm.md", "harness-help.md", "harness-verify.md", "harness-checkpoint.md"]) {
     check(`command: ${cmd}`, fs.existsSync(path.join(COMMANDS_DIR, cmd)));
   }
   check("harness.ts plugin",
@@ -660,7 +660,7 @@ if (legacyPresent.length > 0) {
 }
 
 const commandsManifest = loadCommandsManifest();
-const commandFiles = ["harness-plan.md", "harness-config.md", "harness-rollback-confirm.md", "harness-help.md"];
+const commandFiles = ["harness-plan.md", "harness-config.md", "harness-rollback-confirm.md", "harness-help.md", "harness-verify.md", "harness-checkpoint.md"];
 
 for (const cmd of commandFiles) {
   const src = path.join(__dirname, "..", "templates", "commands", cmd);
