@@ -36,7 +36,27 @@ except Exception:
 mcp = FastMCP("HarnessTools")
 
 # ── Tool toggle ─────────────────────────────────────────────
-_raw = os.environ.get("HARNESS_TOOLS", "all").strip().lower()
+# Task-specific MCP tool profiles.
+# Explicit HARNESS_TOOLS always overrides HARNESS_PROFILE.
+TOOL_PROFILES = {
+    "explore": "get_repo_skeleton,rip_file_lines",
+    "code": "rip_file_lines,apply_search_replace,lint_file",
+    "verify": "rip_file_lines,execute_and_capture",
+    "full": "all",
+}
+
+_profile = os.environ.get("HARNESS_PROFILE", "full").strip().lower()
+
+if _profile not in TOOL_PROFILES:
+    raise ValueError(
+        f"Invalid HARNESS_PROFILE={_profile!r}. "
+        f"Valid profiles: {', '.join(TOOL_PROFILES)}"
+    )
+
+_raw = os.environ.get(
+    "HARNESS_TOOLS",
+    TOOL_PROFILES[_profile],
+).strip().lower()
 if _raw in {"", "none"}:
     _ENABLED = set()
 elif _raw == "all":
@@ -66,13 +86,95 @@ def estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+# ── Lean mode (opt-in) ──────────────────────────────────────
+# HARNESS_LEAN=1 trades verbose, human-friendly tool output for fewer
+# tokens per call. Default (unset) behaviour is byte-identical to before.
+#   * no inline [TOKEN METRIC] line (metrics go to a JSONL file instead)
+#   * 16-char sha256 fingerprints instead of 64 (prefix accepted on edit)
+#   * apply_search_replace returns one line (diff only if HARNESS_DIFF_LINES>0)
+#   * outline map is capped by max_tokens; max_files capped at 200
+#   * find_dependent_references capped at 20 matches / 3000 chars
+#   * repeat reads/maps within HARNESS_DEDUP_WINDOW calls return UNCHANGED
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
+LEAN = os.environ.get("HARNESS_LEAN", "").strip().lower() in {"1", "true", "yes", "on"}
+SHA_SHOW = 16 if LEAN else 64
+_DIFF_LINES = _env_int("HARNESS_DIFF_LINES", 0)
+_DEDUP_WINDOW = _env_int("HARNESS_DEDUP_WINDOW", 8) if LEAN else 0
+_METRICS_LOG = os.environ.get("HARNESS_METRICS_LOG", "").strip()
+if not _METRICS_LOG and LEAN:
+    _METRICS_LOG = os.path.join(os.path.expanduser("~"), ".local", "state",
+                                "harness-optimizer", "metrics.jsonl")
+if _METRICS_LOG.lower() in {"off", "none", "0"}:
+    _METRICS_LOG = ""
+
+
+def _log_metric(tool: str, saved: int, baseline: int, actual: int) -> None:
+    """Append one JSON line to the server-side metrics log (best effort)."""
+    if not _METRICS_LOG:
+        return
+    try:
+        import json
+        import time
+        os.makedirs(os.path.dirname(_METRICS_LOG) or ".", exist_ok=True)
+        with open(_METRICS_LOG, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "ts": int(time.time()), "tool": tool, "saved": int(saved),
+                "baseline": int(baseline), "actual": int(actual),
+                "kind": "estimate",
+            }) + "\n")
+    except Exception:
+        pass
+
+
+def _with_metric(text: str, tool: str, saved: int, baseline: int,
+                 actual: int, line: str) -> str:
+    """Append the inline metric line (default) or log it silently (lean)."""
+    _log_metric(tool, saved, baseline, actual)
+    return text if LEAN else text + "\n\n" + line
+
+
+_CALLSEQ = 0
+_RECENT: dict = {}
+
+
+def _dedup_hit(key, sig) -> int:
+    """Return how many dedup-capable calls ago an identical request with an
+    identical signature was served, or 0 when this is not a repeat (or when
+    dedup is off). Always records this call."""
+    global _CALLSEQ
+    _CALLSEQ += 1
+    prev = _RECENT.get(key)
+    if len(_RECENT) >= 256:
+        _RECENT.pop(next(iter(_RECENT)))  # drop the oldest entry
+    _RECENT[key] = (_CALLSEQ, sig)
+    if _DEDUP_WINDOW <= 0 or prev is None or prev[1] != sig:
+        return 0
+    age = _CALLSEQ - prev[0]
+    return age if age <= _DEDUP_WINDOW else 0
+
+
+def _cap_text(text: str, max_chars: int, marker: str) -> str:
+    """Cut `text` at a line boundary to at most max_chars, adding marker."""
+    if len(text) <= max_chars:
+        return text
+    cut = text[:max_chars].rsplit("\n", 1)[0]
+    return cut + "\n" + marker
+
+
 async def emit_metric(ctx: Context, tool: str, saved: int, baseline: int, actual: int) -> str:
     line = (
         f"[TOKEN METRIC] tool={tool} saved={saved:,} "
         f"baseline={baseline:,} actual={actual:,} type=payload_reduction kind=estimate"
     )
     await ctx.info(line)
-    return line
+    _log_metric(tool, saved, baseline, actual)
+    return "" if LEAN else line
 
 # ═══════════════════════════════════════════════════════════
 # A. Context reading
@@ -117,7 +219,14 @@ async def get_repo_skeleton(repo_path: str = ".", max_files: int = 500,
                 f"saved={ranked_saved} baseline={ranked_baseline} "
                 f"actual={ranked_actual} type=payload_reduction"
             )
-            return ranked + "\n\n" + ranked_metric
+            _out = _with_metric(ranked, "get_repo_skeleton", ranked_saved,
+                                ranked_baseline, ranked_actual, ranked_metric)
+            _age = _dedup_hit(("skel", root, "ranked", max_files, max_tokens),
+                              hashlib.sha1(ranked.encode("utf-8", "replace")).hexdigest())
+            if _age:
+                return (f"UNCHANGED: ranked repo map identical to {_age} call(s) ago; "
+                        f"reuse it.")
+            return _out
 
         reason = ranked.split("ERROR:", 1)[-1].strip()
         redundant = "ranked map unavailable — "
@@ -168,7 +277,7 @@ async def get_repo_skeleton(repo_path: str = ".", max_files: int = 500,
         for fname in filenames:
             if not fname.endswith(".py"):
                 continue
-            if file_count >= max_files:
+            if file_count >= (min(max_files, 200) if LEAN else max_files):
                 break
             file_count += 1
             fpath = os.path.join(dirpath, fname)
@@ -197,6 +306,10 @@ async def get_repo_skeleton(repo_path: str = ".", max_files: int = 500,
                     )
 
     skeleton_text = "\n".join(skeleton_lines)
+    if LEAN:
+        skeleton_text = _cap_text(
+            skeleton_text, max(1, max_tokens) * 4,
+            "# ... outline truncated (raise max_tokens or narrow repo_path)")
 
     baseline = estimate_tokens(" " * total_raw_chars)
     actual = estimate_tokens(skeleton_text)
@@ -206,7 +319,12 @@ async def get_repo_skeleton(repo_path: str = ".", max_files: int = 500,
         f"saved={saved} baseline={baseline} actual={actual} type=payload_reduction"
     )
 
-    outline = skeleton_text + "\n\n" + metric
+    outline = _with_metric(skeleton_text, "get_repo_skeleton", saved, baseline,
+                           actual, metric)
+    _age = _dedup_hit(("skel", root, "outline", max_files, max_tokens),
+                      hashlib.sha1(skeleton_text.encode("utf-8", "replace")).hexdigest())
+    if _age and mode == "outline":
+        return (f"UNCHANGED: outline map identical to {_age} call(s) ago; reuse it.")
     if mode == "outline":
         return outline
 
@@ -340,13 +458,15 @@ async def rip_file_lines(file_path: str, start_line: int, end_line: int, ctx: Co
     if total == 0:
         # Empty file: emit the sha256 of the empty string and a
         # "Lines 1 to 0 of 0" header (documented convention).
-        out = [f"--- Lines 1 to 0 of 0 ---", f"# sha256: {fingerprint}"]
+        out = [f"--- Lines 1 to 0 of 0 ---", f"# sha256: {fingerprint[:SHA_SHOW]}"]
         ripped = "\n".join(out)
         if ctx is not None:
             baseline = estimate_tokens(text)
             actual = estimate_tokens(ripped)
             saved = max(0, baseline - actual)
-            ripped += "\n\n" + await emit_metric(ctx, "rip_file_lines", saved, baseline, actual)
+            _m = await emit_metric(ctx, "rip_file_lines", saved, baseline, actual)
+            if _m:
+                ripped += "\n\n" + _m
         return ripped
 
     if start_line > total:
@@ -384,9 +504,14 @@ async def rip_file_lines(file_path: str, start_line: int, end_line: int, ctx: Co
                         )
                         start_line, end_line = new_start, new_end
 
+    _age = _dedup_hit(("rip", os.path.abspath(file_path), start_line, end_line, context),
+                      fingerprint)
+    if _age:
+        return (f"UNCHANGED: {basename} L{start_line}-{end_line} "
+                f"sha256:{fingerprint[:SHA_SHOW]} (same as {_age} call(s) ago; reuse)")
     header = f"--- Lines {start_line} to {end_line} of {total} ---"
     body = [f"{idx}: {lines[idx - 1]}" for idx in range(start_line, end_line + 1)]
-    head_lines = [header, f"# sha256: {fingerprint}"]
+    head_lines = [header, f"# sha256: {fingerprint[:SHA_SHOW]}"]
     if utf8_lossy:
         head_lines.append(
             "# note: file contained invalid UTF-8; some bytes were "
@@ -466,6 +591,9 @@ async def find_dependent_references(
             max_chars = 8000
     if max_chars < 256:
         return "ERROR: max_chars must be >= 256."
+    if LEAN:
+        max_results = min(max_results, 20)
+        max_chars = min(max_chars, 3000)
 
     root_path = os.path.abspath(os.path.expanduser(repo_path))
     if not os.path.isdir(root_path):
@@ -1045,7 +1173,10 @@ async def apply_search_replace(file_path: str, search_block: str, replace_block:
     before_sha = hashlib.sha256(raw_before).hexdigest()
 
     # Optional stale-content guard. Refuse rather than write anyway.
-    if expected_sha256 is not None and before_sha != expected_sha256:
+    _exp = (expected_sha256 or "").strip().lower()
+    _fresh = (before_sha == expected_sha256) or (
+        LEAN and len(_exp) >= 12 and before_sha.startswith(_exp))
+    if expected_sha256 is not None and not _fresh:
         return (
             f"ERROR: stale content - expected {expected_sha256[:12]}, "
             f"found {before_sha[:12]}\n"
@@ -1121,21 +1252,30 @@ async def apply_search_replace(file_path: str, search_block: str, replace_block:
     metric = (f"[TOKEN METRIC] tool=apply_search_replace saved={saved:,} "
               f"baseline={full_rewrite:,} actual={patch:,} type=payload_reduction")
 
-    head = (
-        "Surgical replacement applied successfully.\n"
-        f"before_sha256: {before_sha}\n"
-        f"after_sha256:  {after_sha}\n"
-        f"changed_range: lines {start_line}-{end_line}\n"
-        "diff:"
-    )
-    tail = "\n\n" + metric
-    diff_budget = _EDIT_MAX_CHARS - len(head) - len(tail)
-    diff_text = _trim_middle(diff_lines, diff_budget)
-    response = head + "\n" + diff_text + tail
+    if LEAN:
+        response = (f"OK L{start_line}-{end_line} "
+                    f"sha256:{after_sha[:SHA_SHOW]} (was {before_sha[:8]})")
+        if _DIFF_LINES > 0:
+            shown = [ln[:120] for ln in diff_lines[:_DIFF_LINES]]
+            response += "\n" + "\n".join(shown)
+        response = _with_metric(response, "apply_search_replace", saved,
+                                full_rewrite, patch, metric)
+    else:
+        head = (
+            "Surgical replacement applied successfully.\n"
+            f"before_sha256: {before_sha}\n"
+            f"after_sha256:  {after_sha}\n"
+            f"changed_range: lines {start_line}-{end_line}\n"
+            "diff:"
+        )
+        tail = "\n\n" + metric
+        diff_budget = _EDIT_MAX_CHARS - len(head) - len(tail)
+        diff_text = _trim_middle(diff_lines, diff_budget)
+        response = head + "\n" + diff_text + tail
 
-    # Last-resort guard; the budget above should already fit.
-    if len(response) > _EDIT_MAX_CHARS:
-        response = response[:_EDIT_MAX_CHARS]
+        # Last-resort guard; the budget above should already fit.
+        if len(response) > _EDIT_MAX_CHARS:
+            response = response[:_EDIT_MAX_CHARS]
 
     # Atomic write: temp file in the same directory, then os.replace.
     target_dir = os.path.dirname(os.path.abspath(path)) or "."

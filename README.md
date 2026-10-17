@@ -54,7 +54,7 @@ Then restart OpenCode. Ask: `List your available tools.`
   returned excerpt), not a measured end-to-end token saving.
 - Global AGENTS.md — token protocol, context pressure protocol, plan mode,
   rollback protocol, metric echo rule
-- Custom commands: /harness-plan, /harness-config, /harness-rollback-confirm, /harness-help
+- Custom commands: /harness-plan, /harness-config, /harness-rollback-confirm, /harness-help, /harness-verify, /harness-checkpoint
 
 ## Requirements
 
@@ -102,6 +102,12 @@ routers and small models hallucinate parameter names (e.g., `path` instead of
 happens, tool calls fail silently or the metric doesn't display.
 
 **Recommended models:** DeepSeek V3/V4, Claude Sonnet/Opus, GPT-4/4o, or any
+
+## Lean mode
+
+Opt-in token savings (`python3 scripts/set-lean.py`): no inline metric lines, short
+fingerprints, one-line edit results, capped outputs, `UNCHANGED` for repeat reads.
+See [docs/LEAN-MODE.md](docs/LEAN-MODE.md).
 
 ## Reducing Tool Overhead
 

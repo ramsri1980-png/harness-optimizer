@@ -11,3 +11,8 @@ Run: npx harness-optimizer --doctor
 ## Plugin errors
 Check ~/.config/opencode/opencode-fallback.jsonc and
 opencode-context-watch.json for syntax errors.
+
+## Edited server.py but nothing changed
+
+The MCP server is loaded once per OpenCode session. After editing `server.py`
+(or changing `HARNESS_*` environment values) restart OpenCode.
